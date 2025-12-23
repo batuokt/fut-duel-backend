@@ -49,13 +49,14 @@ const queue = [];
 // game = {
 //   id,
 //   players: [
-//     { odId, username, socketId, accepted, hp, rp, connected },
-//     { odId, username, socketId, accepted, hp, rp, connected },
+//     { odId, username, socketId, accepted, score, rp, connected },
+//     { odId, username, socketId, accepted, score, rp, connected },
 //   ],
 //   scores: Record<odId, number>,
 //   usedCards: number[],
 //   currentRound: RoundInfo,
 //   roundNumber: number,
+//   maxRounds: number,
 //   moves: Record<odId, MoveInfoWithCard>,
 //   isStarted: boolean,
 //   isFinished: boolean,
@@ -76,7 +77,7 @@ const userToGameId = new Map();
 
 // Configs
 const DISCONNECT_GRACE_MS = 30_000;
-const STARTING_HP = 100;
+const MAX_ROUNDS = 5;
 
 // Very simple RP values (tweak freely)
 const RP_WIN = 20;
@@ -122,12 +123,6 @@ function getOpponentOdId(game, odId) {
   return game.players[oppIdx]?.odId ?? null;
 }
 
-function calculateDamage(statValueSelf, statValueOpp) {
-  // Simple damage formula: difference or minimum 5
-  const diff = Math.max(statValueSelf - statValueOpp, 0);
-  return Math.max(diff, 5);
-}
-
 function calculateRpChange(winnerOdId, loserOdId, reason) {
   // Returns { [odId]: delta }
   const rpChange = {};
@@ -150,10 +145,10 @@ function calculateRpChange(winnerOdId, loserOdId, reason) {
 }
 
 function computeScoresFromGame(game) {
-  // scores: Record<string, number> based on HP difference
+  // scores: Record<string, number> - simple score integers
   const scores = {};
   game.players.forEach((p) => {
-    scores[p.odId] = STARTING_HP - p.hp;
+    scores[p.odId] = p.score;
   });
   return scores;
 }
@@ -180,7 +175,7 @@ function tryMatchPlayers() {
         username: p1.username,
         socketId: p1.socketId,
         accepted: false,
-        hp: STARTING_HP,
+        score: 0,
         rp: 0,
         connected: true,
       },
@@ -189,7 +184,7 @@ function tryMatchPlayers() {
         username: p2.username,
         socketId: p2.socketId,
         accepted: false,
-        hp: STARTING_HP,
+        score: 0,
         rp: 0,
         connected: true,
       },
@@ -202,6 +197,7 @@ function tryMatchPlayers() {
       usedCards: [],
       currentRound: createInitialRound(),
       roundNumber: 1,
+      maxRounds: MAX_ROUNDS,
       moves: {},
       isStarted: false,
       isFinished: false,
@@ -293,30 +289,23 @@ function resolveRoundIfReady(game) {
   const moveA = game.moves[odIds[0]];
   const moveB = game.moves[odIds[1]];
 
-  // Determine round winner
+  // Determine round winner - simple comparison
   let roundWinnerOdId = null;
-  let damage = 0;
 
   if (moveA.statValue === moveB.statValue) {
-    roundWinnerOdId = null;
-    damage = 0;
+    roundWinnerOdId = null; // Draw
   } else if (moveA.statValue > moveB.statValue) {
     roundWinnerOdId = odIds[0];
-    damage = calculateDamage(moveA.statValue, moveB.statValue);
   } else {
     roundWinnerOdId = odIds[1];
-    damage = calculateDamage(moveB.statValue, moveA.statValue);
   }
 
-  // Apply damage as HP loss to loser
+  // Add +1 to winner's score (draw = 0 points)
   if (roundWinnerOdId) {
-    const loserOdId = roundWinnerOdId === odIds[0] ? odIds[1] : odIds[0];
-    const loserIdx = getPlayerIndex(game, loserOdId);
-    if (loserIdx !== -1) {
-      game.players[loserIdx].hp = Math.max(
-        0,
-        game.players[loserIdx].hp - damage
-      );
+    const winnerIdx = getPlayerIndex(game, roundWinnerOdId);
+    if (winnerIdx !== -1) {
+      game.players[winnerIdx].score += 1;
+      game.scores[roundWinnerOdId] = game.players[winnerIdx].score;
     }
   }
 
@@ -332,17 +321,23 @@ function resolveRoundIfReady(game) {
 
   const scores = computeScoresFromGame(game);
 
-  // Check if game is over
+  // Check if game is over (after max rounds or if someone has insurmountable lead)
   let isGameOver = false;
   let finalWinner = null;
-  const p0 = game.players[0];
-  const p1 = game.players[1];
 
-  if (p0.hp <= 0 || p1.hp <= 0) {
+  // Game ends after max rounds
+  if (game.roundNumber >= game.maxRounds) {
     isGameOver = true;
-    if (p0.hp > p1.hp) finalWinner = p0.odId;
-    else if (p1.hp > p0.hp) finalWinner = p1.odId;
-    else finalWinner = null;
+    const p0 = game.players[0];
+    const p1 = game.players[1];
+    
+    if (p0.score > p1.score) {
+      finalWinner = p0.odId;
+    } else if (p1.score > p0.score) {
+      finalWinner = p1.odId;
+    } else {
+      finalWinner = null; // Draw
+    }
   }
 
   // Prepare next round if not over
@@ -363,7 +358,7 @@ function resolveRoundIfReady(game) {
       [odIds[1]]: game.moves[odIds[1]],
     },
     roundWinner: roundWinnerOdId,
-    damage,
+    damage: 0, // No damage in score-based system
     scores,
     isGameOver,
     finalWinner,
@@ -399,12 +394,12 @@ function finishGame(game, { reason, winnerOdId, loserOdId, disconnectedPlayerOdI
   const scores = computeScoresFromGame(game);
 
   if (!winnerOdId && reason === 'normal') {
-    // Determine winner from HP if not given
+    // Determine winner from score if not given
     const p0 = game.players[0];
     const p1 = game.players[1];
-    if (p0.hp > p1.hp) winnerOdId = p0.odId;
-    else if (p1.hp > p0.hp) winnerOdId = p1.odId;
-    else winnerOdId = null;
+    if (p0.score > p1.score) winnerOdId = p0.odId;
+    else if (p1.score > p0.score) winnerOdId = p1.odId;
+    else winnerOdId = null; // Draw
   }
 
   if (!loserOdId && winnerOdId) {
@@ -420,7 +415,7 @@ function finishGame(game, { reason, winnerOdId, loserOdId, disconnectedPlayerOdI
   } else if (reason === 'forfeit') {
     reasonTag = 'forfeit';
   } else {
-    // Fallback: treat as normal game resolution (not exposed to client specifically)
+    // Fallback: treat as normal game resolution
     reasonTag = 'forfeit';
   }
 
