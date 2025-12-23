@@ -53,7 +53,7 @@ const queue = [];
 //     { odId, username, socketId, accepted, score, rp, connected },
 //   ],
 //   scores: Record<odId, number>,
-//   usedCards: number[],
+//   usedCards: Record<odId, number[]>, // Independent decks per player
 //   currentRound: RoundInfo,
 //   roundNumber: number,
 //   maxRounds: number,
@@ -77,7 +77,7 @@ const userToGameId = new Map();
 
 // Configs
 const DISCONNECT_GRACE_MS = 30_000;
-const MAX_ROUNDS = 5;
+const MAX_ROUNDS = 7;
 
 // Very simple RP values (tweak freely)
 const RP_WIN = 20;
@@ -194,7 +194,7 @@ function tryMatchPlayers() {
       id: gameId,
       players,
       scores: { [p1.odId]: 0, [p2.odId]: 0 },
-      usedCards: [],
+      usedCards: { [p1.odId]: [], [p2.odId]: [] }, // Independent decks per player
       currentRound: createInitialRound(),
       roundNumber: 1,
       maxRounds: MAX_ROUNDS,
@@ -263,15 +263,15 @@ function maybeStartGame(game) {
 function emitGameState(game) {
   const scores = computeScoresFromGame(game);
 
-  const payload = {
-    gameId: game.id,
-    currentRound: game.currentRound,
-    scores,
-    usedCards: game.usedCards,
-  };
-
+  // Send each player only their own usedCards array
   game.players.forEach((p) => {
     if (p.socketId && io.sockets.sockets.get(p.socketId)) {
+      const payload = {
+        gameId: game.id,
+        currentRound: game.currentRound,
+        scores,
+        usedCards: game.usedCards[p.odId] || [], // Only send this player's used cards
+      };
       io.to(p.socketId).emit('game-state', payload);
     }
   });
@@ -309,28 +309,35 @@ function resolveRoundIfReady(game) {
     }
   }
 
-  // Update usedCards
+  // Update usedCards - add each player's card to their own array
   odIds.forEach((id) => {
     const mv = game.moves[id];
     if (mv && typeof mv.cardId === 'number') {
-      if (!game.usedCards.includes(mv.cardId)) {
-        game.usedCards.push(mv.cardId);
+      // Initialize array if it doesn't exist
+      if (!game.usedCards[id]) {
+        game.usedCards[id] = [];
+      }
+      // Add card to player's own usedCards array (independent decks)
+      if (!game.usedCards[id].includes(mv.cardId)) {
+        game.usedCards[id].push(mv.cardId);
       }
     }
   });
 
   const scores = computeScoresFromGame(game);
 
-  // Check if game is over (after max rounds or if someone has insurmountable lead)
+  // Check if game is over - strictly wait until all 7 rounds are completed
   let isGameOver = false;
   let finalWinner = null;
 
-  // Game ends after max rounds
+  // Game ends ONLY after the 7th round is resolved
+  // roundNumber is the current round being played, so after round 7 resolves, roundNumber will be 7
   if (game.roundNumber >= game.maxRounds) {
     isGameOver = true;
     const p0 = game.players[0];
     const p1 = game.players[1];
     
+    // Determine winner based on final scores
     if (p0.score > p1.score) {
       finalWinner = p0.odId;
     } else if (p1.score > p0.score) {
@@ -340,23 +347,38 @@ function resolveRoundIfReady(game) {
     }
   }
 
-  // Prepare next round if not over
+  // Calculate next round info for payload (without updating game state yet)
   let nextRound = null;
   if (!isGameOver) {
-    game.roundNumber += 1;
-    game.currentRound = getRoundInfo(game.roundNumber);
-    nextRound = game.currentRound;
+    const nextRoundNumber = game.roundNumber + 1;
+    nextRound = getRoundInfo(nextRoundNumber);
   }
 
-  // Construct RoundCompletedPayload
+  // Construct RoundCompletedPayload (using CURRENT round info)
+  // Ensure both players receive full card data (cardData) of opponent's card
+  // (moveA and moveB are already declared above)
+  
+  // Build moves object with full card data for both players
+  const movesPayload = {
+    [odIds[0]]: {
+      odId: moveA.odId,
+      cardId: moveA.cardId,
+      statValue: moveA.statValue,
+      cardData: moveA.cardData || null, // Full card data (stat, name, image, etc.)
+    },
+    [odIds[1]]: {
+      odId: moveB.odId,
+      cardId: moveB.cardId,
+      statValue: moveB.statValue,
+      cardData: moveB.cardData || null, // Full card data (stat, name, image, etc.)
+    },
+  };
+
   const roundPayload = {
     round: game.currentRound.round,
     stat: game.currentRound.stat,
     isGKRound: game.currentRound.isGKRound,
-    moves: {
-      [odIds[0]]: game.moves[odIds[0]],
-      [odIds[1]]: game.moves[odIds[1]],
-    },
+    moves: movesPayload, // Both players see full card data of opponent
     roundWinner: roundWinnerOdId,
     damage: 0, // No damage in score-based system
     scores,
@@ -372,7 +394,7 @@ function resolveRoundIfReady(game) {
     }
   });
 
-  // Clear moves
+  // Clear moves immediately after emitting round-completed
   game.moves = {};
 
   if (isGameOver) {
@@ -381,8 +403,20 @@ function resolveRoundIfReady(game) {
       winnerOdId: finalWinner,
     });
   } else {
-    // Update game-state for next round
-    emitGameState(game);
+    // Implement 3-second delay before advancing to next round
+    // This gives players time to visualize the card battle
+    setTimeout(() => {
+      // Double-check game is still active and not finished
+      const currentGame = games.get(game.id);
+      if (!currentGame || currentGame.isFinished) return;
+
+      // Advance to next round (only after delay)
+      currentGame.roundNumber += 1;
+      currentGame.currentRound = getRoundInfo(currentGame.roundNumber);
+
+      // Emit game-state ONLY after the delay - this triggers the next round UI
+      emitGameState(currentGame);
+    }, 3000); // 3-second delay
   }
 }
 
@@ -702,11 +736,24 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Prevent multiple moves per round
+    // Prevent multiple moves per round - check if player already submitted for current round
     if (game.moves[odId]) {
       socket.emit('move-error', {
         message: 'Move already submitted for this round',
         code: 'MOVE_ALREADY_SUBMITTED',
+      });
+      return;
+    }
+
+    // Validate card against player's own usedCards list (independent decks)
+    // Check if this player has already used this card in a previous round
+    if (!game.usedCards[odId]) {
+      game.usedCards[odId] = [];
+    }
+    if (game.usedCards[odId].includes(cardId)) {
+      socket.emit('move-error', {
+        message: 'Card already used in this game',
+        code: 'CARD_ALREADY_USED',
       });
       return;
     }
