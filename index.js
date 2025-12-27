@@ -87,25 +87,65 @@ const RP_OPP_DISCONNECT_WIN = 25;
 
 // ============= GAME ROUND / LOGIC HELPERS =============
 
-function getRoundInfo(roundNumber) {
-  // You can tweak this order to match your exact game rules.
-  // Round 4 is explicitly GK round per your requirement.
-  const roundStats = [
-    { round: 1, stat: 'pace', isGKRound: false },
-    { round: 2, stat: 'shooting', isGKRound: false },
-    { round: 3, stat: 'passing', isGKRound: false },
-    { round: 4, stat: 'gk_diving', isGKRound: true }, // GK round
-    { round: 5, stat: 'dribbling', isGKRound: false },
-    { round: 6, stat: 'defending', isGKRound: false },
-    { round: 7, stat: 'physical', isGKRound: false },
-  ];
+// Stats configuration for dynamic question generation
+const GK_STATS = ['DIV', 'HAN', 'KIC', 'REF', 'SPE', 'POS'];
+const FIELD_STATS = ['PAC', 'SHO', 'PAS', 'DRI', 'DEF', 'PHY'];
 
-  const idx = (roundNumber - 1) % roundStats.length;
-  return roundStats[idx];
+/**
+ * Generates a unique set of 7 round questions for a match.
+ * Rules:
+ * - Round 4 (index 3) is ALWAYS a random GK stat
+ * - Other rounds (1-3, 5-7) are randomly selected from FIELD_STATS
+ * - No single field stat can appear more than 2 times in one match
+ */
+function generateMatchQuestions() {
+  const questions = [];
+  const statCount = {}; // Track how many times each field stat has been used
+  
+  for (let i = 0; i < 7; i++) {
+    let stat;
+    let isGKRound = false;
+    
+    if (i === 3) {
+      // Round 4 (index 3) - GK round: pick a random GK stat
+      isGKRound = true;
+      stat = GK_STATS[Math.floor(Math.random() * GK_STATS.length)];
+    } else {
+      // Field stat round - pick a random stat that hasn't been used more than once (max 2 times total)
+      const availableStats = FIELD_STATS.filter(s => (statCount[s] || 0) < 2);
+      stat = availableStats[Math.floor(Math.random() * availableStats.length)];
+      // Track field stat usage (only for non-GK rounds)
+      statCount[stat] = (statCount[stat] || 0) + 1;
+    }
+    
+    questions.push({
+      round: i + 1,
+      stat: stat,
+      isGKRound: isGKRound,
+    });
+  }
+  
+  return questions;
 }
 
-function createInitialRound() {
-  return getRoundInfo(1);
+/**
+ * Gets round info from a game's pre-generated questions array.
+ * @param {Object} game - The game object containing the questions array
+ * @param {number} roundNumber - The 1-indexed round number
+ * @returns {Object} Round info with round, stat, and isGKRound
+ */
+function getRoundInfoFromGame(game, roundNumber) {
+  const idx = roundNumber - 1;
+  if (game.questions && game.questions[idx]) {
+    return game.questions[idx];
+  }
+  // Fallback (should not happen in normal flow)
+  console.warn(`[getRoundInfoFromGame] No questions found for round ${roundNumber}, generating fallback`);
+  return { round: roundNumber, stat: 'PAC', isGKRound: false };
+}
+
+function createInitialRound(game) {
+  return getRoundInfoFromGame(game, 1);
 }
 
 function getOpponentIndex(playerIndex) {
@@ -190,12 +230,17 @@ function tryMatchPlayers() {
       },
     ];
 
+    // Generate unique dynamic questions for this match
+    const questions = generateMatchQuestions();
+    console.log(`[Match ${gameId}] Generated questions:`, questions.map(q => `R${q.round}:${q.stat}${q.isGKRound ? '(GK)' : ''}`).join(', '));
+
     const game = {
       id: gameId,
       players,
       scores: { [p1.odId]: 0, [p2.odId]: 0 },
       usedCards: { [p1.odId]: [], [p2.odId]: [] }, // Independent decks per player
-      currentRound: createInitialRound(),
+      questions, // Dynamic questions array for this match
+      currentRound: null, // Will be set after game object is created
       roundNumber: 1,
       maxRounds: MAX_ROUNDS,
       moves: {},
@@ -204,6 +249,9 @@ function tryMatchPlayers() {
       disconnectTimer: null,
       disconnectedPlayerOdId: null,
     };
+
+    // Set initial round from the generated questions
+    game.currentRound = createInitialRound(game);
 
     games.set(gameId, game);
 
@@ -351,7 +399,7 @@ function resolveRoundIfReady(game) {
   let nextRound = null;
   if (!isGameOver) {
     const nextRoundNumber = game.roundNumber + 1;
-    nextRound = getRoundInfo(nextRoundNumber);
+    nextRound = getRoundInfoFromGame(game, nextRoundNumber);
   }
 
   // Construct RoundCompletedPayload (using CURRENT round info)
@@ -412,7 +460,7 @@ function resolveRoundIfReady(game) {
 
       // Advance to next round (only after delay)
       currentGame.roundNumber += 1;
-      currentGame.currentRound = getRoundInfo(currentGame.roundNumber);
+      currentGame.currentRound = getRoundInfoFromGame(currentGame, currentGame.roundNumber);
 
       // Emit game-state ONLY after the delay - this triggers the next round UI
       emitGameState(currentGame);
