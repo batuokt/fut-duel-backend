@@ -4,12 +4,203 @@ const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const { v4: uuidv4 } = require('uuid');
+const { createClient } = require('@supabase/supabase-js');
+
+// ============= SUPABASE SETUP =============
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+if (!supabaseUrl || !supabaseKey) {
+  console.warn('[Warning] Supabase credentials not found. User profile endpoints may not work.');
+}
+
+const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
 
 // ============= EXPRESS / HTTP =============
 const app = express();
 
+// Middleware
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+// CORS middleware (if needed for API endpoints)
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  const allowedOrigins = [
+    'http://localhost:3000',
+    'https://futduel.com',
+    'https://www.futduel.com',
+    'https://app.futduel.com'
+  ];
+  const vercelPattern = /^https:\/\/fut-duel-[^.]+\.vercel\.app$/;
+  
+  if (!origin || allowedOrigins.includes(origin) || vercelPattern.test(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin || '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  
+  next();
+});
+
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok' });
+});
+
+// ============= HELPER FUNCTIONS =============
+
+/**
+ * Counts unclaimed missions for a user
+ * 
+ * Database Schema Assumptions:
+ * - Table name: 'user_missions' (adjust if your table is named differently, e.g., 'missions', 'UserMissions')
+ * - Column names:
+ *   - 'user_id' (adjust if using 'userId' or 'odId')
+ *   - 'status' (should be 'COMPLETED' for completed missions)
+ *   - 'is_claimed' (boolean, false for unclaimed missions)
+ * 
+ * If your schema differs, update the table/column names in the query below.
+ * 
+ * @param {string} userId - The user's ID (odId)
+ * @returns {Promise<number>} Count of unclaimed missions
+ */
+async function getUnclaimedMissionsCount(userId) {
+  if (!supabase || !userId) {
+    return 0;
+  }
+
+  try {
+    const { count, error } = await supabase
+      .from('user_missions') // Adjust table name if needed
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId) // Adjust column name if needed (e.g., 'userId', 'odId')
+      .eq('status', 'COMPLETED') // Adjust status value if needed
+      .eq('is_claimed', false); // Adjust column name if needed (e.g., 'claimed', 'isClaimed')
+
+    if (error) {
+      console.error('[getUnclaimedMissionsCount] Error:', error);
+      return 0;
+    }
+
+    return count || 0;
+  } catch (error) {
+    console.error('[getUnclaimedMissionsCount] Exception:', error);
+    return 0;
+  }
+}
+
+/**
+ * Fetches user data with unclaimed missions count
+ * @param {string} userId - The user's ID (odId)
+ * @returns {Promise<Object|null>} User object with unclaimedMissionsCount
+ */
+async function getUserWithMissionsCount(userId) {
+  if (!supabase || !userId) {
+    return null;
+  }
+
+  try {
+    // Fetch user data from users table
+    const { data: user, error: userError } = await supabase
+      .from('users')
+      .select('*')
+      .eq('id', userId)
+      .single();
+
+    if (userError) {
+      console.error('[getUserWithMissionsCount] User fetch error:', userError);
+      return null;
+    }
+
+    // Get unclaimed missions count
+    const unclaimedMissionsCount = await getUnclaimedMissionsCount(userId);
+
+    // Return user object with unclaimedMissionsCount
+    return {
+      ...user,
+      unclaimedMissionsCount,
+    };
+  } catch (error) {
+    console.error('[getUserWithMissionsCount] Exception:', error);
+    return null;
+  }
+}
+
+// ============= API ENDPOINTS =============
+
+/**
+ * GET /api/user/profile
+ * Returns user profile with unclaimed missions count
+ * Query params: userId (required)
+ */
+app.get('/api/user/profile', async (req, res) => {
+  try {
+    const { userId } = req.query;
+
+    if (!userId) {
+      return res.status(400).json({
+        error: 'Missing userId parameter',
+        code: 'MISSING_USER_ID',
+      });
+    }
+
+    const user = await getUserWithMissionsCount(userId);
+
+    if (!user) {
+      return res.status(404).json({
+        error: 'User not found',
+        code: 'USER_NOT_FOUND',
+      });
+    }
+
+    res.status(200).json(user);
+  } catch (error) {
+    console.error('[GET /api/user/profile] Error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      code: 'INTERNAL_ERROR',
+    });
+  }
+});
+
+/**
+ * POST /api/user/profile
+ * Returns user profile with unclaimed missions count
+ * Body: { userId: string }
+ */
+app.post('/api/user/profile', async (req, res) => {
+  try {
+    const { userId } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({
+        error: 'Missing userId in request body',
+        code: 'MISSING_USER_ID',
+      });
+    }
+
+    const user = await getUserWithMissionsCount(userId);
+
+    if (!user) {
+      return res.status(404).json({
+        error: 'User not found',
+        code: 'USER_NOT_FOUND',
+      });
+    }
+
+    res.status(200).json(user);
+  } catch (error) {
+    console.error('[POST /api/user/profile] Error:', error);
+    res.status(500).json({
+      error: 'Internal server error',
+      code: 'INTERNAL_ERROR',
+    });
+  }
 });
 
 const PORT = process.env.PORT || 3001;
@@ -20,6 +211,7 @@ const allowedOrigins = [
   'http://localhost:3000',
   'https://futduel.com',
   'https://www.futduel.com',
+  'https://app.futduel.com'
 ];
 
 const vercelPattern = /^https:\/\/fut-duel-[^.]+\.vercel\.app$/;
