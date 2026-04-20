@@ -480,6 +480,8 @@ function maybeStartGame(game) {
   if (!allAccepted) return;
 
   game.isStarted = true;
+  // Record when the first round actually started being played
+  game.currentRoundStartedAt = Date.now();
 
   const gameStartedPayload = {
     gameId: game.id,
@@ -487,7 +489,10 @@ function maybeStartGame(game) {
       odId: p.odId,
       username: p.username,
     })),
-    currentRound: game.currentRound,
+    currentRound: {
+      ...game.currentRound,
+      startedAt: game.currentRoundStartedAt,
+    },
   };
 
   game.players.forEach((p) => {
@@ -508,7 +513,13 @@ function emitGameState(game) {
     if (p.socketId && io.sockets.sockets.get(p.socketId)) {
       const payload = {
         gameId: game.id,
-        currentRound: game.currentRound,
+        currentRound: {
+          ...game.currentRound,
+          // Absolute wall-clock timestamp of when the current round started.
+          // Clients use this to compute accurate remaining time even after
+          // reconnects / backgrounding.
+          startedAt: game.currentRoundStartedAt ?? Date.now(),
+        },
         scores,
         usedCards: game.usedCards[p.odId] || [], // Only send this player's used cards
       };
@@ -653,6 +664,9 @@ function resolveRoundIfReady(game) {
       // Advance to next round (only after delay)
       currentGame.roundNumber += 1;
       currentGame.currentRound = getRoundInfoFromGame(currentGame, currentGame.roundNumber);
+      // Stamp the moment the new round becomes active so clients can
+      // reconstruct accurate remaining time on reconnect / foreground.
+      currentGame.currentRoundStartedAt = Date.now();
 
       // Emit game-state ONLY after the delay - this triggers the next round UI
       emitGameState(currentGame);
