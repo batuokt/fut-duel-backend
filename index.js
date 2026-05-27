@@ -236,6 +236,8 @@ const io = new Server(server, {
 // Queue entries: waiting to be matched
 // { socketId, odId, username }
 const queue = [];
+const DRAFT_ROUNDS = [1, 2, 3, 4];
+const draftQueueByRound = new Map(DRAFT_ROUNDS.map((round) => [round, []]));
 
 // Games map: gameId -> game
 // game = {
@@ -394,78 +396,118 @@ function removeFromQueueBySocket(socketId) {
   }
 }
 
-function tryMatchPlayers() {
-  while (queue.length >= 2) {
-    const p1 = queue.shift();
-    const p2 = queue.shift();
-    if (!p1 || !p2) break;
+function removeFromDraftQueueBySocket(socketId) {
+  for (const draftQueue of draftQueueByRound.values()) {
+    const idx = draftQueue.findIndex((p) => p.socketId === socketId);
+    if (idx !== -1) {
+      draftQueue.splice(idx, 1);
+    }
+  }
+}
 
-    const gameId = uuidv4();
-    const players = [
-      {
-        odId: p1.odId,
-        username: p1.username,
-        socketId: p1.socketId,
-        accepted: false,
-        score: 0,
-        rp: 0,
-        connected: true,
-      },
-      {
-        odId: p2.odId,
-        username: p2.username,
-        socketId: p2.socketId,
-        accepted: false,
-        score: 0,
-        rp: 0,
-        connected: true,
-      },
-    ];
+function removeFromAllQueuesBySocket(socketId) {
+  removeFromQueueBySocket(socketId);
+  removeFromDraftQueueBySocket(socketId);
+}
 
-    // Generate unique dynamic questions for this match
-    const questions = generateMatchQuestions();
-    console.log(`[Match ${gameId}] Generated questions:`, questions.map(q => `R${q.round}:${q.stat}${q.isGKRound ? '(GK)' : ''}`).join(', '));
+function createMatchFromQueueEntries(p1, p2, { mode = 'normal', round = null } = {}) {
+  const gameId = uuidv4();
+  const players = [
+    {
+      odId: p1.odId,
+      username: p1.username,
+      socketId: p1.socketId,
+      accepted: false,
+      score: 0,
+      rp: 0,
+      connected: true,
+    },
+    {
+      odId: p2.odId,
+      username: p2.username,
+      socketId: p2.socketId,
+      accepted: false,
+      score: 0,
+      rp: 0,
+      connected: true,
+    },
+  ];
 
-    const game = {
-      id: gameId,
-      players,
-      scores: { [p1.odId]: 0, [p2.odId]: 0 },
-      usedCards: { [p1.odId]: [], [p2.odId]: [] }, // Independent decks per player
-      questions, // Dynamic questions array for this match
-      currentRound: null, // Will be set after game object is created
-      roundNumber: 1,
-      maxRounds: MAX_ROUNDS,
-      moves: {},
-      isStarted: false,
-      isFinished: false,
-      disconnectTimer: null,
-      disconnectedPlayerOdId: null,
-    };
+  // Generate unique dynamic questions for this match
+  const questions = generateMatchQuestions();
+  console.log(`[Match ${gameId}] Generated questions:`, questions.map(q => `R${q.round}:${q.stat}${q.isGKRound ? '(GK)' : ''}`).join(', '));
 
-    // Set initial round from the generated questions
-    game.currentRound = createInitialRound(game);
+  const game = {
+    id: gameId,
+    players,
+    scores: { [p1.odId]: 0, [p2.odId]: 0 },
+    usedCards: { [p1.odId]: [], [p2.odId]: [] }, // Independent decks per player
+    questions, // Dynamic questions array for this match
+    currentRound: null, // Will be set after game object is created
+    roundNumber: 1,
+    maxRounds: MAX_ROUNDS,
+    moves: {},
+    isStarted: false,
+    isFinished: false,
+    disconnectTimer: null,
+    disconnectedPlayerOdId: null,
+  };
 
-    games.set(gameId, game);
+  // Set initial round from the generated questions
+  game.currentRound = createInitialRound(game);
 
-    // Map relationships
-    socketToGameId.set(p1.socketId, gameId);
-    socketToGameId.set(p2.socketId, gameId);
-    userToGameId.set(p1.odId, gameId);
-    userToGameId.set(p2.odId, gameId);
+  games.set(gameId, game);
 
-    // Notify both players of match-found
-    const payloadFor = (me, opponent, isHost) => ({
+  // Map relationships
+  socketToGameId.set(p1.socketId, gameId);
+  socketToGameId.set(p2.socketId, gameId);
+  userToGameId.set(p1.odId, gameId);
+  userToGameId.set(p2.odId, gameId);
+
+  // Notify both players of match-found
+  const payloadFor = (opponent, isHost) => {
+    const payload = {
       gameId,
       opponent: {
         id: opponent.odId,
         username: opponent.username,
       },
       isHost,
-    });
+    };
 
-    // p1 is host (isHost = true), p2 is guest
-    io.to(p1.socketId).emit('match-found', payloadFor(p1, p2, true));
-    io.to(p2.socketId).emit('match-found', payloadFor(p2, p1, false));
+    if (mode === 'draft') {
+      payload.mode = 'draft';
+      payload.round = round;
+      payload.opponent.rank_score = opponent.rank_score ?? null;
+      payload.opponent.avatar_key = opponent.avatar_key ?? null;
+    }
+
+    return payload;
+  };
+
+  // p1 is host (isHost = true), p2 is guest
+  io.to(p1.socketId).emit('match-found', payloadFor(p2, true));
+  io.to(p2.socketId).emit('match-found', payloadFor(p1, false));
+}
+
+function tryMatchPlayers() {
+  while (queue.length >= 2) {
+    const p1 = queue.shift();
+    const p2 = queue.shift();
+    if (!p1 || !p2) break;
+    createMatchFromQueueEntries(p1, p2, { mode: 'normal' });
+  }
+}
+
+function tryMatchDraftPlayers(round) {
+  const roundQueue = draftQueueByRound.get(round);
+  if (!roundQueue) return;
+
+  while (roundQueue.length >= 2) {
+    const p1 = roundQueue.shift();
+    const p2 = roundQueue.shift();
+    if (!p1 || !p2) break;
+    createMatchFromQueueEntries(p1, p2, { mode: 'draft', round });
   }
 }
 
@@ -761,7 +803,7 @@ io.on('connection', (socket) => {
   socket.on('disconnect', (reason) => {
     console.log('[Socket] Disconnected:', socket.id, 'reason:', reason);
 
-    removeFromQueueBySocket(socket.id);
+    removeFromAllQueuesBySocket(socket.id);
 
     const odId = socketToUser.get(socket.id);
     const gameId = socketToGameId.get(socket.id);
@@ -828,8 +870,8 @@ io.on('connection', (socket) => {
     socketToUser.set(socket.id, odId);
     userToSocket.set(odId, socket.id);
 
-    // Avoid duplicate queue entries
-    removeFromQueueBySocket(socket.id);
+    // Avoid duplicate entries across all queue pools
+    removeFromAllQueuesBySocket(socket.id);
     queue.push({ socketId: socket.id, odId, username });
 
     const position = queue.findIndex((p) => p.socketId === socket.id) + 1;
@@ -840,8 +882,41 @@ io.on('connection', (socket) => {
     tryMatchPlayers();
   });
 
+  // { userId, username, round, rank_score?, avatar_key? }
+  socket.on('join-draft-queue', (data) => {
+    const { userId, username, round, rank_score, avatar_key } = data || {};
+    if (!userId || !username || !draftQueueByRound.has(round)) {
+      socket.emit('game-error', {
+        message: 'Missing userId, username, or valid round',
+        code: 'INVALID_DRAFT_QUEUE_PAYLOAD',
+      });
+      return;
+    }
+
+    socketToUser.set(socket.id, userId);
+    userToSocket.set(userId, socket.id);
+
+    // Avoid duplicate entries across all queue pools
+    removeFromAllQueuesBySocket(socket.id);
+
+    const draftQueue = draftQueueByRound.get(round);
+    draftQueue.push({
+      socketId: socket.id,
+      odId: userId,
+      username,
+      rank_score,
+      avatar_key,
+    });
+
+    const position = draftQueue.findIndex((p) => p.socketId === socket.id) + 1;
+    const queueSize = draftQueue.length;
+    socket.emit('queue-joined', { mode: 'draft', round, position, queueSize });
+
+    tryMatchDraftPlayers(round);
+  });
+
   socket.on('leave-queue', () => {
-    removeFromQueueBySocket(socket.id);
+    removeFromAllQueuesBySocket(socket.id);
     socket.emit('queue-left');
   });
 
