@@ -356,28 +356,36 @@ async function fetchPlayerSquad(odId) {
   return players.map(mapDbPlayer);
 }
 
-function cachePlayerSquadForGame(game, odId, squad) {
+function getPlayerSquad(game, odId) {
+  const player = getPlayer(game, odId);
+  if (player?.squad?.length) return player.squad;
+  return game.playerSquads?.[odId] || null;
+}
+
+function setPlayerSquad(game, odId, squad) {
+  const player = getPlayer(game, odId);
   if (!game.playerSquads) {
     game.playerSquads = {};
   }
 
   if (Array.isArray(squad) && squad.length > 0) {
+    if (player) player.squad = squad;
     game.playerSquads[odId] = squad;
     return;
   }
 
-  if (game.playerSquads[odId]?.length) {
+  if (getPlayerSquad(game, odId)?.length) {
     return;
   }
 
   fetchPlayerSquad(odId)
     .then((loaded) => {
-      if (loaded?.length) {
-        game.playerSquads[odId] = loaded;
-      }
+      if (!loaded?.length) return;
+      if (player) player.squad = loaded;
+      game.playerSquads[odId] = loaded;
     })
     .catch((err) => {
-      console.error('[cachePlayerSquadForGame]', odId, err);
+      console.error('[setPlayerSquad]', odId, err);
     });
 }
 
@@ -399,8 +407,11 @@ function buildAutoPickMove(game, odId, squad) {
   const pool = available.length > 0 ? available : fallback;
   if (pool.length === 0) return null;
 
-  const card = pool[Math.floor(Math.random() * pool.length)];
-  const statValue = getStatValueForRound(card, game.currentRound.stat);
+  const roundStat = game.currentRound.stat;
+  const card = pool.reduce((best, c) =>
+    getStatValueForRound(c, roundStat) > getStatValueForRound(best, roundStat) ? c : best,
+  );
+  const statValue = getStatValueForRound(card, roundStat);
 
   return {
     odId,
@@ -410,21 +421,28 @@ function buildAutoPickMove(game, odId, squad) {
   };
 }
 
+function hasDisconnectedPlayerWithoutMove(game) {
+  return game.players.some((p) => !p.connected && !game.moves[p.odId]);
+}
+
 async function ensureAutoPicksForMissingMoves(game) {
   const odIds = game.players.map((p) => p.odId);
 
   for (const odId of odIds) {
     if (game.moves[odId]) continue;
 
-    if (!game.playerSquads?.[odId]?.length) {
+    const player = getPlayer(game, odId);
+    // Never auto-pick for disconnected players — grace/forfeit handles them
+    if (!player?.connected) continue;
+
+    let squad = getPlayerSquad(game, odId);
+    if (!squad?.length) {
       const loaded = await fetchPlayerSquad(odId);
       if (loaded?.length) {
-        if (!game.playerSquads) game.playerSquads = {};
-        game.playerSquads[odId] = loaded;
+        setPlayerSquad(game, odId, loaded);
+        squad = loaded;
       }
     }
-
-    const squad = game.playerSquads?.[odId];
     if (!squad?.length) {
       console.warn(`[auto-pick] No squad for ${odId} in game ${game.id}`);
       continue;
@@ -681,6 +699,7 @@ function createMatchFromQueueEntries(p1, p2, { mode = 'normal', round = null } =
       connected: true,
       lastSeenAt: Date.now(),
       disconnectGraceTimer: null,
+      squad: null,
     },
     {
       odId: p2.odId,
@@ -692,6 +711,7 @@ function createMatchFromQueueEntries(p1, p2, { mode = 'normal', round = null } =
       connected: true,
       lastSeenAt: Date.now(),
       disconnectGraceTimer: null,
+      squad: null,
     },
   ];
 
@@ -821,6 +841,9 @@ function emitGameState(game) {
 
 function completeRound(game) {
   if (!game || game.isFinished || game.phase === 'reveal') return;
+
+  // Do not resolve a round while a disconnected player still owes a move
+  if (hasDisconnectedPlayerWithoutMove(game)) return;
 
   const odIds = game.players.map((p) => p.odId);
   const moveA = game.moves[odIds[0]];
@@ -969,7 +992,12 @@ function resolveRoundIfReady(game) {
 async function resolveRoundAuthoritative(game) {
   if (!game || game.isFinished || !game.isStarted || game.phase === 'reveal') return;
 
+  // Disconnected + no move: wait for reconnect or disconnect grace → forfeit (no empty auto-pick)
+  if (hasDisconnectedPlayerWithoutMove(game)) return;
+
   await ensureAutoPicksForMissingMoves(game);
+
+  if (hasDisconnectedPlayerWithoutMove(game)) return;
 
   const odIds = game.players.map((p) => p.odId);
   const hasA = !!game.moves[odIds[0]];
@@ -980,6 +1008,7 @@ async function resolveRoundAuthoritative(game) {
     return;
   }
 
+  // Only close with a single move when the missing player is still connected (active timeout)
   completeRound(game);
 }
 
@@ -1236,7 +1265,7 @@ io.on('connection', (socket) => {
     player.connected = true;
     player.lastSeenAt = Date.now();
 
-    cachePlayerSquadForGame(game, odId, squad);
+    setPlayerSquad(game, odId, squad);
 
     socket.emit('game-joined', {
       gameId,
