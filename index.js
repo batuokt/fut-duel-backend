@@ -291,6 +291,152 @@ const RP_OPP_DISCONNECT_WIN = 25;
 const GK_STATS = ['DIV', 'HAN', 'KIC', 'REF', 'SPE', 'POS'];
 const FIELD_STATS = ['PAC', 'SHO', 'PAS', 'DRI', 'DEF', 'PHY'];
 
+// Maps server round stat codes to player object keys (matches mobile game.tsx)
+const SERVER_STAT_TO_LOCAL = {
+  PAC: 'pace',
+  SHO: 'shooting',
+  PAS: 'passing',
+  DRI: 'dribbling',
+  DEF: 'defense',
+  PHY: 'physical',
+  DIV: 'gk_diving',
+  HAN: 'gk_handling',
+  KIC: 'gk_kicking',
+  REF: 'gk_reflexes',
+  SPE: 'gk_speed',
+  POS: 'gk_positioning',
+};
+
+function mapDbPlayer(p) {
+  return {
+    id: p.id,
+    overall: p.overall,
+    position: p.position,
+    name: p.name,
+    nationality: p.nationality ?? p.nation,
+    pace: p.pace,
+    shooting: p.shooting,
+    passing: p.passing,
+    dribbling: p.dribbling,
+    defense: p.defending ?? p.defense,
+    physical: p.physical,
+    gk_diving: p.gk_diving,
+    gk_handling: p.gk_handling,
+    gk_kicking: p.gk_kicking,
+    gk_reflexes: p.gk_reflexes,
+    gk_speed: p.gk_speed,
+    gk_positioning: p.gk_positioning,
+    image_url: p.image_url,
+    flag_url: p.flag_url,
+  };
+}
+
+async function fetchPlayerSquad(odId) {
+  if (!supabase || !odId) return null;
+
+  const { data: squadRows, error: squadError } = await supabase
+    .from('user_squads')
+    .select('player_id')
+    .eq('user_id', odId);
+
+  if (squadError || !squadRows?.length) {
+    return null;
+  }
+
+  const playerIds = squadRows.map((r) => r.player_id);
+  const { data: players, error: playersError } = await supabase
+    .from('players')
+    .select('*')
+    .in('id', playerIds);
+
+  if (playersError || !players?.length) {
+    return null;
+  }
+
+  return players.map(mapDbPlayer);
+}
+
+function cachePlayerSquadForGame(game, odId, squad) {
+  if (!game.playerSquads) {
+    game.playerSquads = {};
+  }
+
+  if (Array.isArray(squad) && squad.length > 0) {
+    game.playerSquads[odId] = squad;
+    return;
+  }
+
+  if (game.playerSquads[odId]?.length) {
+    return;
+  }
+
+  fetchPlayerSquad(odId)
+    .then((loaded) => {
+      if (loaded?.length) {
+        game.playerSquads[odId] = loaded;
+      }
+    })
+    .catch((err) => {
+      console.error('[cachePlayerSquadForGame]', odId, err);
+    });
+}
+
+function getStatValueForRound(card, roundStat) {
+  const statKey = SERVER_STAT_TO_LOCAL[roundStat] || String(roundStat).toLowerCase();
+  return card?.[statKey] ?? 0;
+}
+
+function buildAutoPickMove(game, odId, squad) {
+  const gkRound = !!game.currentRound?.isGKRound;
+  const used = game.usedCards[odId] || [];
+
+  const available = squad.filter((c) => {
+    if (used.includes(c.id)) return false;
+    const cardIsGK = String(c.position || '').toUpperCase() === 'GK';
+    return gkRound ? cardIsGK : !cardIsGK;
+  });
+  const fallback = squad.filter((c) => !used.includes(c.id));
+  const pool = available.length > 0 ? available : fallback;
+  if (pool.length === 0) return null;
+
+  const card = pool[Math.floor(Math.random() * pool.length)];
+  const statValue = getStatValueForRound(card, game.currentRound.stat);
+
+  return {
+    odId,
+    cardId: card.id,
+    statValue,
+    cardData: card,
+  };
+}
+
+async function ensureAutoPicksForMissingMoves(game) {
+  const odIds = game.players.map((p) => p.odId);
+
+  for (const odId of odIds) {
+    if (game.moves[odId]) continue;
+
+    if (!game.playerSquads?.[odId]?.length) {
+      const loaded = await fetchPlayerSquad(odId);
+      if (loaded?.length) {
+        if (!game.playerSquads) game.playerSquads = {};
+        game.playerSquads[odId] = loaded;
+      }
+    }
+
+    const squad = game.playerSquads?.[odId];
+    if (!squad?.length) {
+      console.warn(`[auto-pick] No squad for ${odId} in game ${game.id}`);
+      continue;
+    }
+
+    const move = buildAutoPickMove(game, odId, squad);
+    if (move) {
+      game.moves[odId] = move;
+    }
+  }
+}
+
 /**
  * Generates a unique set of 7 round questions for a match.
  * Rules:
@@ -431,7 +577,7 @@ function scheduleRoundTimer(game) {
     if (!current || current.isFinished || !current.isStarted || current.phase === 'reveal') {
       return;
     }
-    resolveRoundAuthoritative(current);
+    void resolveRoundAuthoritative(current);
   }, remaining);
 }
 
@@ -570,6 +716,7 @@ function createMatchFromQueueEntries(p1, p2, { mode = 'normal', round = null } =
     roundTimer: null,
     lastRoundCompletedPayload: null,
     lastGameEndedPayload: null,
+    playerSquads: {},
   };
 
   // Set initial round from the generated questions
@@ -819,8 +966,11 @@ function resolveRoundIfReady(game) {
   completeRound(game);
 }
 
-function resolveRoundAuthoritative(game) {
+async function resolveRoundAuthoritative(game) {
   if (!game || game.isFinished || !game.isStarted || game.phase === 'reveal') return;
+
+  await ensureAutoPicksForMissingMoves(game);
+
   const odIds = game.players.map((p) => p.odId);
   const hasA = !!game.moves[odIds[0]];
   const hasB = !!game.moves[odIds[1]];
@@ -1042,9 +1192,9 @@ io.on('connection', (socket) => {
 
   // --------- JOIN GAME ROOM: join-game ---------
 
-  // { gameId, odId, username }
+  // { gameId, odId, username, squad? }
   socket.on('join-game', (data) => {
-    const { gameId, odId, username } = data || {};
+    const { gameId, odId, username, squad } = data || {};
     if (!gameId || !odId) {
       socket.emit('game-error', {
         message: 'Missing gameId or odId',
@@ -1085,6 +1235,8 @@ io.on('connection', (socket) => {
     player.socketId = socket.id;
     player.connected = true;
     player.lastSeenAt = Date.now();
+
+    cachePlayerSquadForGame(game, odId, squad);
 
     socket.emit('game-joined', {
       gameId,
