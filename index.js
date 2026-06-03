@@ -254,8 +254,12 @@ const draftQueueByRound = new Map(DRAFT_ROUNDS.map((round) => [round, []]));
 //   moves: Record<odId, MoveInfoWithCard>,
 //   isStarted: boolean,
 //   isFinished: boolean,
-//   disconnectTimer: Timeout | null,
-//   disconnectedPlayerOdId: string | null,
+//   ended: boolean,
+//   phase: 'lobby' | 'playing' | 'reveal' | 'ended',
+//   roundTimer: Timeout | null,
+//   lastRoundCompletedPayload: object | null,
+//   lastGameEndedPayload: object | null,
+//   players[].disconnectGraceTimer: Timeout | null,
 // }
 const games = new Map();
 
@@ -269,8 +273,10 @@ const socketToGameId = new Map();
 // odId -> gameId
 const userToGameId = new Map();
 
-// Configs
-const DISCONNECT_GRACE_MS = 30_000;
+// Configs — keep in sync with mobile client
+const DISCONNECT_GRACE_MS = 25_000; // slightly above client OPPONENT_INACTIVITY_MS (23000)
+const ROUND_TIME_MS = 15_000; // client ROUND_TIME
+const ROUND_REVEAL_MS = 3_000;
 const MAX_ROUNDS = 7;
 
 // Very simple RP values (tweak freely)
@@ -387,6 +393,112 @@ function computeScoresFromGame(game) {
   return scores;
 }
 
+function getPlayer(game, odId) {
+  const idx = getPlayerIndex(game, odId);
+  return idx === -1 ? null : game.players[idx];
+}
+
+function clearPlayerDisconnectGrace(player) {
+  if (!player) return;
+  if (player.disconnectGraceTimer) {
+    clearTimeout(player.disconnectGraceTimer);
+    player.disconnectGraceTimer = null;
+  }
+}
+
+function clearAllDisconnectGraceTimers(game) {
+  if (!game) return;
+  game.players.forEach(clearPlayerDisconnectGrace);
+}
+
+function clearRoundTimer(game) {
+  if (!game) return;
+  if (game.roundTimer) {
+    clearTimeout(game.roundTimer);
+    game.roundTimer = null;
+  }
+}
+
+function scheduleRoundTimer(game) {
+  if (!game || game.isFinished || !game.isStarted || game.phase === 'reveal') return;
+
+  clearRoundTimer(game);
+  const startedAt = game.currentRoundStartedAt ?? Date.now();
+  const remaining = Math.max(0, ROUND_TIME_MS - (Date.now() - startedAt));
+
+  game.roundTimer = setTimeout(() => {
+    const current = games.get(game.id);
+    if (!current || current.isFinished || !current.isStarted || current.phase === 'reveal') {
+      return;
+    }
+    resolveRoundAuthoritative(current);
+  }, remaining);
+}
+
+function buildGameStatePayload(game, odId) {
+  return {
+    gameId: game.id,
+    currentRound: {
+      ...game.currentRound,
+      startedAt: game.currentRoundStartedAt ?? Date.now(),
+    },
+    scores: computeScoresFromGame(game),
+    usedCards: game.usedCards[odId] || [],
+  };
+}
+
+function emitGameStateToPlayer(game, odId) {
+  const player = getPlayer(game, odId);
+  if (!player?.socketId) return;
+  io.to(player.socketId).emit('game-state', buildGameStatePayload(game, odId));
+}
+
+function sendAuthoritativeStateToSocket(socket, game, odId) {
+  if (game.isFinished && game.lastGameEndedPayload) {
+    socket.emit('game-ended', game.lastGameEndedPayload);
+    return;
+  }
+  if (game.phase === 'reveal' && game.lastRoundCompletedPayload) {
+    socket.emit('round-completed', game.lastRoundCompletedPayload);
+    return;
+  }
+  if (game.isStarted) {
+    socket.emit('game-state', buildGameStatePayload(game, odId));
+  }
+}
+
+function bindSocketToGame(socket, gameId, odId) {
+  socket.join(gameId);
+  socketToUser.set(socket.id, odId);
+  userToSocket.set(odId, socket.id);
+  socketToGameId.set(socket.id, gameId);
+  userToGameId.set(odId, gameId);
+}
+
+function startPlayerDisconnectGrace(game, odId) {
+  const player = getPlayer(game, odId);
+  if (!player) return;
+
+  clearPlayerDisconnectGrace(player);
+  player.connected = false;
+
+  player.disconnectGraceTimer = setTimeout(() => {
+    const current = games.get(game.id);
+    if (!current || current.isFinished) return;
+
+    const currentPlayer = getPlayer(current, odId);
+    if (!currentPlayer || currentPlayer.connected) return;
+
+    const opponentOdId = getOpponentOdId(current, odId);
+    finishGame(current, {
+      reason: 'opponent-disconnected',
+      forfeiterUserId: odId,
+      winnerOdId: opponentOdId,
+      loserOdId: odId,
+    });
+  }, DISCONNECT_GRACE_MS);
+}
+
 // ============= MATCHMAKING HELPERS =============
 
 function removeFromQueueBySocket(socketId) {
@@ -421,6 +533,8 @@ function createMatchFromQueueEntries(p1, p2, { mode = 'normal', round = null } =
       score: 0,
       rp: 0,
       connected: true,
+      lastSeenAt: Date.now(),
+      disconnectGraceTimer: null,
     },
     {
       odId: p2.odId,
@@ -430,6 +544,8 @@ function createMatchFromQueueEntries(p1, p2, { mode = 'normal', round = null } =
       score: 0,
       rp: 0,
       connected: true,
+      lastSeenAt: Date.now(),
+      disconnectGraceTimer: null,
     },
   ];
 
@@ -449,8 +565,11 @@ function createMatchFromQueueEntries(p1, p2, { mode = 'normal', round = null } =
     moves: {},
     isStarted: false,
     isFinished: false,
-    disconnectTimer: null,
-    disconnectedPlayerOdId: null,
+    ended: false,
+    phase: 'lobby',
+    roundTimer: null,
+    lastRoundCompletedPayload: null,
+    lastGameEndedPayload: null,
   };
 
   // Set initial round from the generated questions
@@ -522,6 +641,7 @@ function maybeStartGame(game) {
   if (!allAccepted) return;
 
   game.isStarted = true;
+  game.phase = 'playing';
   // Record when the first round actually started being played
   game.currentRoundStartedAt = Date.now();
 
@@ -537,61 +657,45 @@ function maybeStartGame(game) {
     },
   };
 
-  game.players.forEach((p) => {
-    if (p.socketId && io.sockets.sockets.get(p.socketId)) {
-      io.to(p.socketId).emit('game-started', gameStartedPayload);
-    }
-  });
+  io.to(game.id).emit('game-started', gameStartedPayload);
 
-  // Initial game-state
+  // Initial game-state (per-player usedCards)
   emitGameState(game);
+  scheduleRoundTimer(game);
 }
 
 function emitGameState(game) {
-  const scores = computeScoresFromGame(game);
-
-  // Send each player only their own usedCards array
   game.players.forEach((p) => {
-    if (p.socketId && io.sockets.sockets.get(p.socketId)) {
-      const payload = {
-        gameId: game.id,
-        currentRound: {
-          ...game.currentRound,
-          // Absolute wall-clock timestamp of when the current round started.
-          // Clients use this to compute accurate remaining time even after
-          // reconnects / backgrounding.
-          startedAt: game.currentRoundStartedAt ?? Date.now(),
-        },
-        scores,
-        usedCards: game.usedCards[p.odId] || [], // Only send this player's used cards
-      };
-      io.to(p.socketId).emit('game-state', payload);
-    }
+    emitGameStateToPlayer(game, p.odId);
   });
 }
 
 // ============= ROUND RESOLUTION / END GAME =============
 
-function resolveRoundIfReady(game) {
-  if (!game || game.isFinished) return;
+function completeRound(game) {
+  if (!game || game.isFinished || game.phase === 'reveal') return;
+
   const odIds = game.players.map((p) => p.odId);
-
-  // Need both moves
-  if (!game.moves[odIds[0]] || !game.moves[odIds[1]]) return;
-
   const moveA = game.moves[odIds[0]];
   const moveB = game.moves[odIds[1]];
 
-  // Determine round winner - simple comparison
   let roundWinnerOdId = null;
-
-  if (moveA.statValue === moveB.statValue) {
-    roundWinnerOdId = null; // Draw
-  } else if (moveA.statValue > moveB.statValue) {
+  if (moveA && moveB) {
+    if (moveA.statValue === moveB.statValue) {
+      roundWinnerOdId = null;
+    } else if (moveA.statValue > moveB.statValue) {
+      roundWinnerOdId = odIds[0];
+    } else {
+      roundWinnerOdId = odIds[1];
+    }
+  } else if (moveA) {
     roundWinnerOdId = odIds[0];
-  } else {
+  } else if (moveB) {
     roundWinnerOdId = odIds[1];
   }
+
+  clearRoundTimer(game);
+  game.phase = 'reveal';
 
   // Add +1 to winner's score (draw = 0 points)
   if (roundWinnerOdId) {
@@ -651,43 +755,40 @@ function resolveRoundIfReady(game) {
   // Ensure both players receive full card data (cardData) of opponent's card
   // (moveA and moveB are already declared above)
   
-  // Build moves object with full card data for both players
-  const movesPayload = {
-    [odIds[0]]: {
+  const movesPayload = {};
+  if (moveA) {
+    movesPayload[odIds[0]] = {
       odId: moveA.odId,
       cardId: moveA.cardId,
       statValue: moveA.statValue,
-      cardData: moveA.cardData || null, // Full card data (stat, name, image, etc.)
-    },
-    [odIds[1]]: {
+      cardData: moveA.cardData || null,
+    };
+  }
+  if (moveB) {
+    movesPayload[odIds[1]] = {
       odId: moveB.odId,
       cardId: moveB.cardId,
       statValue: moveB.statValue,
-      cardData: moveB.cardData || null, // Full card data (stat, name, image, etc.)
-    },
-  };
+      cardData: moveB.cardData || null,
+    };
+  }
 
   const roundPayload = {
     round: game.currentRound.round,
     stat: game.currentRound.stat,
     isGKRound: game.currentRound.isGKRound,
-    moves: movesPayload, // Both players see full card data of opponent
+    moves: movesPayload,
     roundWinner: roundWinnerOdId,
-    damage: 0, // No damage in score-based system
+    damage: 0,
     scores,
     isGameOver,
     finalWinner,
     nextRound,
   };
 
-  // Emit round-completed to both players
-  game.players.forEach((p) => {
-    if (p.socketId && io.sockets.sockets.get(p.socketId)) {
-      io.to(p.socketId).emit('round-completed', roundPayload);
-    }
-  });
+  game.lastRoundCompletedPayload = roundPayload;
+  io.to(game.id).emit('round-completed', roundPayload);
 
-  // Clear moves immediately after emitting round-completed
   game.moves = {};
 
   if (isGameOver) {
@@ -696,99 +797,110 @@ function resolveRoundIfReady(game) {
       winnerOdId: finalWinner,
     });
   } else {
-    // Implement 3-second delay before advancing to next round
-    // This gives players time to visualize the card battle
     setTimeout(() => {
-      // Double-check game is still active and not finished
       const currentGame = games.get(game.id);
       if (!currentGame || currentGame.isFinished) return;
 
-      // Advance to next round (only after delay)
       currentGame.roundNumber += 1;
       currentGame.currentRound = getRoundInfoFromGame(currentGame, currentGame.roundNumber);
-      // Stamp the moment the new round becomes active so clients can
-      // reconstruct accurate remaining time on reconnect / foreground.
       currentGame.currentRoundStartedAt = Date.now();
+      currentGame.phase = 'playing';
 
-      // Emit game-state ONLY after the delay - this triggers the next round UI
       emitGameState(currentGame);
-    }, 3000); // 3-second delay
+      scheduleRoundTimer(currentGame);
+    }, ROUND_REVEAL_MS);
   }
 }
 
-function finishGame(game, { reason, winnerOdId, loserOdId, disconnectedPlayerOdId } = {}) {
+function resolveRoundIfReady(game) {
+  if (!game || game.isFinished || game.phase === 'reveal') return;
+  const odIds = game.players.map((p) => p.odId);
+  if (!game.moves[odIds[0]] || !game.moves[odIds[1]]) return;
+  completeRound(game);
+}
+
+function resolveRoundAuthoritative(game) {
+  if (!game || game.isFinished || !game.isStarted || game.phase === 'reveal') return;
+  const odIds = game.players.map((p) => p.odId);
+  const hasA = !!game.moves[odIds[0]];
+  const hasB = !!game.moves[odIds[1]];
+
+  if (hasA && hasB) {
+    resolveRoundIfReady(game);
+    return;
+  }
+
+  completeRound(game);
+}
+
+function finishGame(game, { reason, winnerOdId, loserOdId, forfeiterUserId } = {}) {
   if (!game || game.isFinished) return;
   game.isFinished = true;
+  game.ended = true;
+  game.phase = 'ended';
+
+  clearRoundTimer(game);
+  clearAllDisconnectGraceTimers(game);
 
   const odIds = game.players.map((p) => p.odId);
   const scores = computeScoresFromGame(game);
 
-  if (!winnerOdId && reason === 'normal') {
-    // Determine winner from score if not given
-    const p0 = game.players[0];
-    const p1 = game.players[1];
-    if (p0.score > p1.score) winnerOdId = p0.odId;
-    else if (p1.score > p0.score) winnerOdId = p1.odId;
-    else winnerOdId = null; // Draw
-  }
+  const isForfeit =
+    reason === 'forfeit' || reason === 'opponent-disconnected';
 
-  if (!loserOdId && winnerOdId) {
-    loserOdId = odIds.find((id) => id !== winnerOdId) || null;
-  }
+  if (isForfeit) {
+    const forfeiter = forfeiterUserId || loserOdId;
+    const winner =
+      winnerOdId || odIds.find((id) => id !== forfeiter) || null;
 
-  const rpChange = calculateRpChange(winnerOdId, loserOdId, reason);
+    const payload = {
+      gameId: game.id,
+      isGameOver: true,
+      forfeiterUserId: forfeiter || '',
+      winnerUserId: winner || '',
+      scores,
+      reason: reason === 'forfeit' ? 'forfeit' : 'opponent-disconnected',
+      winner: winner || '',
+      loser: forfeiter || '',
+      rpChange: calculateRpChange(winner, forfeiter, reason),
+    };
 
-  // Build GameEndedPayload
-  let reasonTag;
-  if (reason === 'opponent-disconnected') {
-    reasonTag = 'opponent-disconnected';
-  } else if (reason === 'forfeit') {
-    reasonTag = 'forfeit';
+    game.lastGameEndedPayload = payload;
+    io.to(game.id).emit('game-ended', payload);
   } else {
-    // Fallback: treat as normal game resolution
-    reasonTag = 'forfeit';
-  }
-
-  let disconnectedPlayer = null;
-  if (disconnectedPlayerOdId) {
-    const p = game.players.find((pl) => pl.odId === disconnectedPlayerOdId);
-    if (p) {
-      disconnectedPlayer = {
-        odId: p.odId,
-        username: p.username,
-      };
+    if (!winnerOdId && reason === 'normal') {
+      const p0 = game.players[0];
+      const p1 = game.players[1];
+      if (p0.score > p1.score) winnerOdId = p0.odId;
+      else if (p1.score > p0.score) winnerOdId = p1.odId;
+      else winnerOdId = null;
     }
-  }
 
-  const payload = {
-    gameId: game.id,
-    reason: reasonTag,
-    winner: winnerOdId || '',
-    loser: loserOdId || '',
-    scores,
-    rpChange,
-    disconnectedPlayer,
-  };
-
-  // Emit to all connected players
-  game.players.forEach((p) => {
-    if (p.socketId && io.sockets.sockets.get(p.socketId)) {
-      io.to(p.socketId).emit('game-ended', payload);
+    if (!loserOdId && winnerOdId) {
+      loserOdId = odIds.find((id) => id !== winnerOdId) || null;
     }
-  });
 
-  // Cleanup timers
-  if (game.disconnectTimer) {
-    clearTimeout(game.disconnectTimer);
-    game.disconnectTimer = null;
+    const rpChange = calculateRpChange(winnerOdId, loserOdId, reason);
+
+    const payload = {
+      gameId: game.id,
+      isGameOver: true,
+      scores,
+      winnerUserId: winnerOdId || '',
+      winner: winnerOdId || '',
+      loser: loserOdId || '',
+      reason: 'normal',
+      rpChange,
+    };
+
+    game.lastGameEndedPayload = payload;
+    io.to(game.id).emit('game-ended', payload);
   }
 
-  // Clean helper maps
   game.players.forEach((p) => {
     if (!p) return;
-    const sId = p.socketId;
-    if (sId) {
-      socketToGameId.delete(sId);
+    if (p.socketId) {
+      socketToGameId.delete(p.socketId);
     }
     userToGameId.delete(p.odId);
   });
@@ -814,44 +926,18 @@ io.on('connection', (socket) => {
       userToSocket.delete(odId);
     }
 
-    if (!gameId) return;
+    if (!gameId || !odId) return;
     const game = games.get(gameId);
     if (!game || game.isFinished) return;
 
-    const idx = getPlayerIndex(game, odId);
-    if (idx === -1) return;
-    const player = game.players[idx];
-    player.connected = false;
+    const player = getPlayer(game, odId);
+    if (!player) return;
 
-    const opponentIdx = getOpponentIndex(idx);
-    const opponent = game.players[opponentIdx];
+    io.to(game.id).emit('opponent-disconnected', {
+      username: player.username,
+    });
 
-    // Notify opponent immediately
-    if (opponent && opponent.socketId && io.sockets.sockets.get(opponent.socketId)) {
-      io.to(opponent.socketId).emit('opponent-disconnected', {
-        username: player.username,
-      });
-    }
-
-    game.disconnectedPlayerOdId = player.odId;
-
-    // Start grace timer
-    if (game.disconnectTimer) {
-      clearTimeout(game.disconnectTimer);
-      game.disconnectTimer = null;
-    }
-    game.disconnectTimer = setTimeout(() => {
-      const stillDisconnected = !game.players[idx].connected;
-      if (stillDisconnected && !game.isFinished) {
-        const winnerOdId = opponent ? opponent.odId : null;
-        finishGame(game, {
-          reason: 'opponent-disconnected',
-          winnerOdId,
-          loserOdId: player.odId,
-          disconnectedPlayerOdId: player.odId,
-        });
-      }
-    }, DISCONNECT_GRACE_MS);
+    startPlayerDisconnectGrace(game, odId);
   });
 
   // --------- MATCHMAKING: join-queue / leave-queue ---------
@@ -928,7 +1014,7 @@ io.on('connection', (socket) => {
     if (!gameId) return;
 
     const game = games.get(gameId);
-    if (!game || game.isFinished) {
+    if (!game) {
       socket.emit('game-error', {
         message: 'Game not found',
         code: 'GAME_NOT_FOUND',
@@ -942,6 +1028,13 @@ io.on('connection', (socket) => {
 
     const idx = getPlayerIndex(game, odId);
     if (idx === -1) return;
+
+    socket.join(gameId);
+
+    if (game.isFinished) {
+      sendAuthoritativeStateToSocket(socket, game, odId);
+      return;
+    }
 
     game.players[idx].accepted = true;
     maybeStartGame(game);
@@ -962,7 +1055,7 @@ io.on('connection', (socket) => {
     }
 
     const game = games.get(gameId);
-    if (!game || game.isFinished) {
+    if (!game) {
       socket.emit('game-error', {
         message: 'Game not found',
         code: 'GAME_NOT_FOUND',
@@ -971,15 +1064,8 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Bind user <-> socket
-    socketToUser.set(socket.id, odId);
-    userToSocket.set(odId, socket.id);
-    socketToGameId.set(socket.id, gameId);
-    userToGameId.set(odId, gameId);
-
-    let idx = getPlayerIndex(game, odId);
+    const idx = getPlayerIndex(game, odId);
     if (idx === -1) {
-      // If player not found in game, reject
       socket.emit('game-error', {
         message: 'Player not part of this game',
         code: 'NOT_IN_GAME',
@@ -988,13 +1074,17 @@ io.on('connection', (socket) => {
       return;
     }
 
-    // Update username if provided (for safety)
+    bindSocketToGame(socket, gameId, odId);
+
+    const player = game.players[idx];
     if (username) {
-      game.players[idx].username = username;
+      player.username = username;
     }
 
-    game.players[idx].socketId = socket.id;
-    game.players[idx].connected = true;
+    clearPlayerDisconnectGrace(player);
+    player.socketId = socket.id;
+    player.connected = true;
+    player.lastSeenAt = Date.now();
 
     socket.emit('game-joined', {
       gameId,
@@ -1002,10 +1092,7 @@ io.on('connection', (socket) => {
       playerIndex: idx,
     });
 
-    // If game already started, send current state
-    if (game.isStarted && !game.isFinished) {
-      emitGameState(game);
-    }
+    sendAuthoritativeStateToSocket(socket, game, odId);
   });
 
   // --------- LEAVE GAME (FORFEIT): leave-game ---------
@@ -1016,10 +1103,15 @@ io.on('connection', (socket) => {
     if (!gameId) return;
 
     const game = games.get(gameId);
-    if (!game || game.isFinished) return;
+    if (!game) return;
 
     const odId = socketToUser.get(socket.id);
     if (!odId) return;
+
+    if (game.isFinished) {
+      sendAuthoritativeStateToSocket(socket, game, odId);
+      return;
+    }
 
     const idx = getPlayerIndex(game, odId);
     if (idx === -1) return;
@@ -1028,6 +1120,7 @@ io.on('connection', (socket) => {
 
     finishGame(game, {
       reason: 'forfeit',
+      forfeiterUserId: odId,
       winnerOdId: opponentOdId,
       loserOdId: odId,
     });
@@ -1048,7 +1141,20 @@ io.on('connection', (socket) => {
     }
 
     const game = games.get(gameId);
-    if (!game || game.isFinished || !game.isStarted) {
+    if (!game) {
+      socket.emit('move-error', {
+        message: 'Game not available',
+        code: 'GAME_NOT_AVAILABLE',
+      });
+      return;
+    }
+
+    if (game.isFinished) {
+      sendAuthoritativeStateToSocket(socket, game, odId);
+      return;
+    }
+
+    if (!game.isStarted) {
       socket.emit('move-error', {
         message: 'Game not available',
         code: 'GAME_NOT_AVAILABLE',
@@ -1098,14 +1204,7 @@ io.on('connection', (socket) => {
     // Acknowledge move to player
     socket.emit('move-received', { cardId });
 
-    // Notify opponent that a move was made
-    const opponentOdId = getOpponentOdId(game, odId);
-    if (opponentOdId) {
-      const oppSocketId = userToSocket.get(opponentOdId);
-      if (oppSocketId && io.sockets.sockets.get(oppSocketId)) {
-        io.to(oppSocketId).emit('opponent-moved');
-      }
-    }
+    socket.to(gameId).emit('opponent-moved');
 
     // Attempt to resolve round if both moves present
     resolveRoundIfReady(game);
