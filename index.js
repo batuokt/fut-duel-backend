@@ -721,6 +721,8 @@ function createMatchFromQueueEntries(p1, p2, { mode = 'normal', round = null } =
 
   const game = {
     id: gameId,
+    mode, // 'normal' | 'draft' — forfeit cezası/geçmiş kaydında draft'ı ayırmak için
+    round, // draft turu (varsa)
     players,
     scores: { [p1.odId]: 0, [p2.odId]: 0 },
     usedCards: { [p1.odId]: [], [p2.odId]: [] }, // Independent decks per player
@@ -1013,25 +1015,86 @@ async function resolveRoundAuthoritative(game) {
 }
 
 /**
- * Kaçan (forfeiter) oyuncunun RP cezasını SUNUCU OTORİTESİYLE doğrudan
- * Supabase'e yazar. Kazananın client'ına bağımlı değildir (kaçan oyuncu
- * uygulamayı kapatmış olabilir, kazanan game-ended'i kaçırmış olabilir).
- * forfeit_audit üzerinden dedup yapılır → client'ın penalize_forfeiter /
- * penalize_self_forfeit çağrıları aynı pencerede çift ceza uygulamaz.
+ * Forfeit kesinleştiğinde kaçan oyuncuyu SUNUCU OTORİTESİYLE işler:
+ *  1) RP cezasını doğrudan Supabase'e yazar (server_penalize_forfeiter).
+ *  2) Kaçanın forfeit_loss maç geçmişi kaydını yazar (server_record_match_history).
+ *
+ * Kazananın client'ına bağımlı değildir (kaçan oyuncu uygulamayı kapatmış
+ * olabilir → /result'a ulaşıp kendi RP cezası ve geçmiş kaydını yazamaz).
+ * forfeit_audit ve match_history dedup pencereleri sayesinde, kazananın
+ * online olarak yaptığı client çağrılarıyla çift kayıt/çift ceza oluşmaz.
+ *
+ * Draft maçlarında RP değişmez; bu yüzden draft'ta ceza/geçmiş yazılmaz
+ * (mevcut client davranışıyla tutarlı).
  */
-async function persistForfeiterPenalty(forfeiterOdId, gameId) {
-  if (!supabase || !forfeiterOdId) return;
+async function handleServerForfeit(game, forfeiterOdId, winnerOdId) {
+  if (!supabase || !game || !forfeiterOdId) return;
+  if (game.mode === 'draft') return; // Draft: RP/geçmiş sunucudan yazılmaz.
+
+  const gameId = game.id;
+
+  // 1) RP cezası — uygulanan rp_loss'u geçmiş kaydında kullanmak için sakla.
+  let rpLoss = 0;
   try {
     const { data, error } = await supabase.rpc('server_penalize_forfeiter', {
       p_forfeiter_id: forfeiterOdId,
     });
     if (error) {
-      console.error(`[forfeit-penalty] game ${gameId} forfeiter ${forfeiterOdId} RPC error:`, error.message);
-      return;
+      console.error(`[forfeit] game ${gameId} penalty RPC error:`, error.message);
+    } else {
+      rpLoss = Number(data?.rp_loss) || 0;
+      console.log(`[forfeit] game ${gameId} forfeiter ${forfeiterOdId} penalty:`, data);
     }
-    console.log(`[forfeit-penalty] game ${gameId} forfeiter ${forfeiterOdId}:`, data);
   } catch (err) {
-    console.error(`[forfeit-penalty] game ${gameId} forfeiter ${forfeiterOdId} exception:`, err);
+    console.error(`[forfeit] game ${gameId} penalty exception:`, err);
+  }
+
+  // 2) Kaçan oyuncunun forfeit_loss maç geçmişi.
+  try {
+    const forfeiterPlayer = getPlayer(game, forfeiterOdId);
+    const winnerPlayer = winnerOdId ? getPlayer(game, winnerOdId) : null;
+
+    let oppName = winnerPlayer?.username || 'Opponent';
+    let oppAvatar = null;
+    let oppRp = null;
+    if (winnerOdId) {
+      try {
+        const { data: prof } = await supabase
+          .from('profiles')
+          .select('username, avatar_key, rank_score')
+          .eq('id', winnerOdId)
+          .maybeSingle();
+        if (prof) {
+          oppName = prof.username || oppName;
+          oppAvatar = prof.avatar_key ?? null;
+          oppRp = prof.rank_score ?? null;
+        }
+      } catch (e) {
+        // profil çekilemese de geçmiş kaydını username ile yaz.
+      }
+    }
+
+    const { error: histError } = await supabase.rpc('server_record_match_history', {
+      p_user_id: forfeiterOdId,
+      p_opponent_name: oppName,
+      p_opponent_user_id: winnerOdId || null,
+      p_is_bot: false,
+      p_opponent_avatar: oppAvatar,
+      p_opponent_rp: oppRp,
+      p_my_score: forfeiterPlayer?.score ?? 0,
+      p_opp_score: winnerPlayer?.score ?? 0,
+      p_outcome: 'forfeit_loss',
+      p_rp_change: rpLoss > 0 ? -rpLoss : 0,
+      p_rounds: null,
+      p_match_type: 'competitive',
+    });
+    if (histError) {
+      console.error(`[forfeit] game ${gameId} history RPC error:`, histError.message);
+    } else {
+      console.log(`[forfeit] game ${gameId} forfeiter ${forfeiterOdId} history recorded`);
+    }
+  } catch (err) {
+    console.error(`[forfeit] game ${gameId} history exception:`, err);
   }
 }
 
@@ -1070,11 +1133,12 @@ function finishGame(game, { reason, winnerOdId, loserOdId, forfeiterUserId } = {
     game.lastGameEndedPayload = payload;
     io.to(game.id).emit('game-ended', payload);
 
-    // Sunucu-otoriter RP cezası: kaçan oyuncunun RP'sini doğrudan düşür.
-    // (Kazananın client'ı game-ended ile penalize_forfeiter de çağırabilir;
-    // forfeit_audit dedup'ı sayesinde çift ceza olmaz.)
+    // Sunucu-otoriter: kaçan oyuncunun RP cezası + forfeit_loss maç geçmişi.
+    // (Kazananın client'ı game-ended ile penalize_forfeiter + kendi forfeit_win
+    // geçmişini de yazar; forfeit_audit / match_history dedup'ı sayesinde çift
+    // ceza ya da çift kayıt olmaz.)
     if (forfeiter) {
-      void persistForfeiterPenalty(forfeiter, game.id);
+      void handleServerForfeit(game, forfeiter, winner);
     }
   } else {
     if (!winnerOdId && reason === 'normal') {
