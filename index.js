@@ -1012,6 +1012,29 @@ async function resolveRoundAuthoritative(game) {
   completeRound(game);
 }
 
+/**
+ * Kaçan (forfeiter) oyuncunun RP cezasını SUNUCU OTORİTESİYLE doğrudan
+ * Supabase'e yazar. Kazananın client'ına bağımlı değildir (kaçan oyuncu
+ * uygulamayı kapatmış olabilir, kazanan game-ended'i kaçırmış olabilir).
+ * forfeit_audit üzerinden dedup yapılır → client'ın penalize_forfeiter /
+ * penalize_self_forfeit çağrıları aynı pencerede çift ceza uygulamaz.
+ */
+async function persistForfeiterPenalty(forfeiterOdId, gameId) {
+  if (!supabase || !forfeiterOdId) return;
+  try {
+    const { data, error } = await supabase.rpc('server_penalize_forfeiter', {
+      p_forfeiter_id: forfeiterOdId,
+    });
+    if (error) {
+      console.error(`[forfeit-penalty] game ${gameId} forfeiter ${forfeiterOdId} RPC error:`, error.message);
+      return;
+    }
+    console.log(`[forfeit-penalty] game ${gameId} forfeiter ${forfeiterOdId}:`, data);
+  } catch (err) {
+    console.error(`[forfeit-penalty] game ${gameId} forfeiter ${forfeiterOdId} exception:`, err);
+  }
+}
+
 function finishGame(game, { reason, winnerOdId, loserOdId, forfeiterUserId } = {}) {
   if (!game || game.isFinished) return;
   game.isFinished = true;
@@ -1046,6 +1069,13 @@ function finishGame(game, { reason, winnerOdId, loserOdId, forfeiterUserId } = {
 
     game.lastGameEndedPayload = payload;
     io.to(game.id).emit('game-ended', payload);
+
+    // Sunucu-otoriter RP cezası: kaçan oyuncunun RP'sini doğrudan düşür.
+    // (Kazananın client'ı game-ended ile penalize_forfeiter de çağırabilir;
+    // forfeit_audit dedup'ı sayesinde çift ceza olmaz.)
+    if (forfeiter) {
+      void persistForfeiterPenalty(forfeiter, game.id);
+    }
   } else {
     if (!winnerOdId && reason === 'normal') {
       const p0 = game.players[0];
