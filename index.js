@@ -290,8 +290,21 @@ const RP_OPP_DISCONNECT_WIN = 25;
 // Stats configuration for dynamic question generation
 const GK_STATS = ['DIV', 'HAN', 'KIC', 'REF', 'SPE', 'POS'];
 const FIELD_STATS = ['PAC', 'SHO', 'PAS', 'DRI', 'DEF', 'PHY'];
+const OVR_STAT = 'OVR';
 
-// Maps server round stat codes to player object keys (matches mobile game.tsx)
+function isGkStatCode(stat) {
+  return GK_STATS.includes(stat);
+}
+
+function isOvrStatCode(stat) {
+  return stat === OVR_STAT;
+}
+
+function pickRandomStat(pool) {
+  return pool[Math.floor(Math.random() * pool.length)];
+}
+
+// Maps server round stat codes to player object keys (matches mobile lib/matchStats.ts)
 const SERVER_STAT_TO_LOCAL = {
   PAC: 'pace',
   SHO: 'shooting',
@@ -305,6 +318,7 @@ const SERVER_STAT_TO_LOCAL = {
   REF: 'gk_reflexes',
   SPE: 'gk_speed',
   POS: 'gk_positioning',
+  OVR: 'overall',
 };
 
 function mapDbPlayer(p) {
@@ -390,24 +404,31 @@ function setPlayerSquad(game, odId, squad) {
 }
 
 function getStatValueForRound(card, roundStat) {
+  if (isOvrStatCode(roundStat)) {
+    return card?.overall ?? 0;
+  }
   const statKey = SERVER_STAT_TO_LOCAL[roundStat] || String(roundStat).toLowerCase();
   return card?.[statKey] ?? 0;
 }
 
+function isCardEligibleForRoundStat(card, roundStat) {
+  const cardIsGK = String(card?.position || '').toUpperCase() === 'GK';
+  if (isGkStatCode(roundStat)) return cardIsGK;
+  return !cardIsGK;
+}
+
 function buildAutoPickMove(game, odId, squad) {
-  const gkRound = !!game.currentRound?.isGKRound;
+  const roundStat = game.currentRound?.stat;
   const used = game.usedCards[odId] || [];
 
   const available = squad.filter((c) => {
     if (used.includes(c.id)) return false;
-    const cardIsGK = String(c.position || '').toUpperCase() === 'GK';
-    return gkRound ? cardIsGK : !cardIsGK;
+    return isCardEligibleForRoundStat(c, roundStat);
   });
   const fallback = squad.filter((c) => !used.includes(c.id));
   const pool = available.length > 0 ? available : fallback;
   if (pool.length === 0) return null;
 
-  const roundStat = game.currentRound.stat;
   const card = pool.reduce((best, c) =>
     getStatValueForRound(c, roundStat) > getStatValueForRound(best, roundStat) ? c : best,
   );
@@ -458,37 +479,32 @@ async function ensureAutoPicksForMissingMoves(game) {
 /**
  * Generates a unique set of 7 round questions for a match.
  * Rules:
- * - Round 4 (index 3) is ALWAYS a random GK stat
- * - Other rounds (1-3, 5-7) are randomly selected from FIELD_STATS
- * - No single field stat can appear more than 2 times in one match
+ * - Round 4: random GK stat OR OVR (7 options)
+ * - Other rounds: random field stat OR OVR (max 2 repeats per field stat; OVR exempt)
  */
 function generateMatchQuestions() {
   const questions = [];
-  const statCount = {}; // Track how many times each field stat has been used
-  
+  const statCount = {};
+
   for (let i = 0; i < 7; i++) {
     let stat;
-    let isGKRound = false;
-    
     if (i === 3) {
-      // Round 4 (index 3) - GK round: pick a random GK stat
-      isGKRound = true;
-      stat = GK_STATS[Math.floor(Math.random() * GK_STATS.length)];
+      stat = pickRandomStat([...GK_STATS, OVR_STAT]);
     } else {
-      // Field stat round - pick a random stat that hasn't been used more than once (max 2 times total)
-      const availableStats = FIELD_STATS.filter(s => (statCount[s] || 0) < 2);
-      stat = availableStats[Math.floor(Math.random() * availableStats.length)];
-      // Track field stat usage (only for non-GK rounds)
-      statCount[stat] = (statCount[stat] || 0) + 1;
+      const availableFieldStats = FIELD_STATS.filter((s) => (statCount[s] || 0) < 2);
+      stat = pickRandomStat([...availableFieldStats, OVR_STAT]);
+      if (FIELD_STATS.includes(stat)) {
+        statCount[stat] = (statCount[stat] || 0) + 1;
+      }
     }
-    
+
     questions.push({
       round: i + 1,
-      stat: stat,
-      isGKRound: isGKRound,
+      stat,
+      isGKRound: isGkStatCode(stat),
     });
   }
-  
+
   return questions;
 }
 
@@ -717,7 +733,7 @@ function createMatchFromQueueEntries(p1, p2, { mode = 'normal', round = null } =
 
   // Generate unique dynamic questions for this match
   const questions = generateMatchQuestions();
-  console.log(`[Match ${gameId}] Generated questions:`, questions.map(q => `R${q.round}:${q.stat}${q.isGKRound ? '(GK)' : ''}`).join(', '));
+  console.log(`[Match ${gameId}] Generated questions:`, questions.map(q => `R${q.round}:${q.stat}${q.isGKRound ? '(GK)' : isOvrStatCode(q.stat) ? '(OVR)' : ''}`).join(', '));
 
   const game = {
     id: gameId,
@@ -1466,6 +1482,25 @@ io.on('connection', (socket) => {
         code: 'CARD_ALREADY_USED',
       });
       return;
+    }
+
+    const roundStat = game.currentRound?.stat;
+    if (cardData) {
+      if (!isCardEligibleForRoundStat(cardData, roundStat)) {
+        socket.emit('move-error', {
+          message: 'Card not eligible for this round stat',
+          code: 'INVALID_CARD_FOR_STAT',
+        });
+        return;
+      }
+      const expectedValue = getStatValueForRound(cardData, roundStat);
+      if (statValue !== expectedValue) {
+        socket.emit('move-error', {
+          message: 'Stat value does not match card',
+          code: 'INVALID_STAT_VALUE',
+        });
+        return;
+      }
     }
 
     // Save move
