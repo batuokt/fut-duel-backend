@@ -291,13 +291,15 @@ const RP_OPP_DISCONNECT_WIN = 25;
 const GK_STATS = ['DIV', 'HAN', 'KIC', 'REF', 'SPE', 'POS'];
 const FIELD_STATS = ['PAC', 'SHO', 'PAS', 'DRI', 'DEF', 'PHY'];
 const OVR_STAT = 'OVR';
-
-function isGkStatCode(stat) {
-  return GK_STATS.includes(stat);
-}
+const GK_ROUND = 4;
 
 function isOvrStatCode(stat) {
   return stat === OVR_STAT;
+}
+
+/** Tur 4 her zaman kaleci turu — stat OVR olsa bile GK vs GK. */
+function isGKRound(roundNumber) {
+  return roundNumber === GK_ROUND;
 }
 
 function pickRandomStat(pool) {
@@ -411,21 +413,25 @@ function getStatValueForRound(card, roundStat) {
   return card?.[statKey] ?? 0;
 }
 
-function isCardEligibleForRoundStat(card, roundStat) {
+function isCardEligibleForRound(card, roundNumber) {
   const cardIsGK = String(card?.position || '').toUpperCase() === 'GK';
-  if (isGkStatCode(roundStat)) return cardIsGK;
+  if (isGKRound(roundNumber)) return cardIsGK;
   return !cardIsGK;
 }
 
 function buildAutoPickMove(game, odId, squad) {
+  const roundNumber = game.currentRound?.round;
   const roundStat = game.currentRound?.stat;
   const used = game.usedCards[odId] || [];
+  const gkOnlyPick = isGKRound(roundNumber);
 
   const available = squad.filter((c) => {
     if (used.includes(c.id)) return false;
-    return isCardEligibleForRoundStat(c, roundStat);
+    return isCardEligibleForRound(c, roundNumber);
   });
-  const fallback = squad.filter((c) => !used.includes(c.id));
+  const fallback = gkOnlyPick
+    ? []
+    : squad.filter((c) => !used.includes(c.id));
   const pool = available.length > 0 ? available : fallback;
   if (pool.length === 0) return null;
 
@@ -479,7 +485,7 @@ async function ensureAutoPicksForMissingMoves(game) {
 /**
  * Generates a unique set of 7 round questions for a match.
  * Rules:
- * - Round 4: random GK stat OR OVR (7 options)
+ * - Round 4: random GK stat OR OVR — always goalkeeper picks (OVR compares overall)
  * - Other rounds: random field stat OR OVR (max 2 repeats per field stat; OVR exempt)
  */
 function generateMatchQuestions() {
@@ -501,7 +507,7 @@ function generateMatchQuestions() {
     questions.push({
       round: i + 1,
       stat,
-      isGKRound: isGkStatCode(stat),
+      isGKRound: i + 1 === GK_ROUND,
     });
   }
 
@@ -521,7 +527,7 @@ function getRoundInfoFromGame(game, roundNumber) {
   }
   // Fallback (should not happen in normal flow)
   console.warn(`[getRoundInfoFromGame] No questions found for round ${roundNumber}, generating fallback`);
-  return { round: roundNumber, stat: 'PAC', isGKRound: false };
+  return { round: roundNumber, stat: 'PAC', isGKRound: isGKRound(roundNumber) };
 }
 
 function createInitialRound(game) {
@@ -1484,9 +1490,10 @@ io.on('connection', (socket) => {
       return;
     }
 
+    const roundNumber = game.currentRound?.round;
     const roundStat = game.currentRound?.stat;
     if (cardData) {
-      if (!isCardEligibleForRoundStat(cardData, roundStat)) {
+      if (!isCardEligibleForRound(cardData, roundNumber)) {
         socket.emit('move-error', {
           message: 'Card not eligible for this round stat',
           code: 'INVALID_CARD_FOR_STAT',
