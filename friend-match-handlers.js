@@ -5,6 +5,8 @@
 
 /** @type {Map<string, { inviterId: string, inviteeId: string, status: string }>} */
 const friendInvites = new Map();
+/** Client bildirimi: bot maçı vb. sunucu userToGameId dışı oturumlar */
+const userActiveMatchSessions = new Map();
 
 function attachFriendMatchHandlers(io, deps) {
   const { supabase, userToSocket, socketToUser, userToGameId, createMatchFromQueueEntries } = deps;
@@ -119,6 +121,8 @@ function attachFriendMatchHandlers(io, deps) {
       userToGameId.delete(invite.inviterId);
       userToGameId.delete(invite.inviteeId);
     }
+    userActiveMatchSessions.delete(invite.inviterId);
+    userActiveMatchSessions.delete(invite.inviteeId);
 
     const [inviterProfile, inviteeProfile] = await Promise.all([
       fetchProfile(invite.inviterId),
@@ -167,7 +171,9 @@ function attachFriendMatchHandlers(io, deps) {
   }
 
   function isUserInActiveGame(userId) {
-    return Boolean(userId && userToGameId?.get(userId));
+    if (!userId) return false;
+    if (userToGameId?.get(userId)) return true;
+    return userActiveMatchSessions.has(userId);
   }
 
   function notifyInviteeCancelled(inviteId, inviteeId) {
@@ -186,9 +192,17 @@ function attachFriendMatchHandlers(io, deps) {
       socket.data.userId = uid;
     });
 
+    socket.on('enter-active-game', ({ odId, gameId }) => {
+      const uid = odId || socket.data.userId || socketToUser.get(socket.id);
+      if (!uid) return;
+      userActiveMatchSessions.set(uid, gameId || 'active');
+    });
+
     socket.on('release-active-game', ({ odId, gameId }) => {
       const uid = odId || socket.data.userId || socketToUser.get(socket.id);
-      if (!uid || !userToGameId) return;
+      if (!uid) return;
+      userActiveMatchSessions.delete(uid);
+      if (!userToGameId) return;
       const activeGameId = userToGameId.get(uid);
       if (!activeGameId) return;
       if (gameId && activeGameId !== gameId) return;
@@ -196,20 +210,21 @@ function attachFriendMatchHandlers(io, deps) {
     });
 
     socket.on('friend-challenge-precheck', ({ toUserId }, callback) => {
+      if (typeof callback !== 'function') return;
       const inviterId = socket.data.userId || socketToUser.get(socket.id);
       if (!inviterId || !toUserId) {
-        callback?.({ ok: false, reason: 'invalid_target' });
+        callback({ ok: false, reason: 'invalid_target' });
         return;
       }
       if (isUserInActiveGame(inviterId)) {
-        callback?.({ ok: false, reason: 'inviter_in_game' });
+        callback({ ok: false, reason: 'inviter_in_game' });
         return;
       }
       if (isUserInActiveGame(toUserId)) {
-        callback?.({ ok: false, reason: 'invitee_in_game' });
+        callback({ ok: false, reason: 'invitee_in_game' });
         return;
       }
-      callback?.({ ok: true });
+      callback({ ok: true });
     });
 
     socket.on('friend-challenge', async ({ toUserId, inviteId }) => {
