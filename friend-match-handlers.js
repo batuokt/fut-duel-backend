@@ -114,6 +114,12 @@ function attachFriendMatchHandlers(io, deps) {
       return false;
     }
 
+    // Bitmiş maç sonrası result ekranında userToGameId kalıntısı friendly eşleşmeyi engelleyebilir.
+    if (userToGameId) {
+      userToGameId.delete(invite.inviterId);
+      userToGameId.delete(invite.inviteeId);
+    }
+
     const [inviterProfile, inviteeProfile] = await Promise.all([
       fetchProfile(invite.inviterId),
       fetchProfile(invite.inviteeId),
@@ -178,6 +184,15 @@ function attachFriendMatchHandlers(io, deps) {
       userToSocket.set(uid, socket.id);
       socketToUser.set(socket.id, uid);
       socket.data.userId = uid;
+    });
+
+    socket.on('release-active-game', ({ odId, gameId }) => {
+      const uid = odId || socket.data.userId || socketToUser.get(socket.id);
+      if (!uid || !userToGameId) return;
+      const activeGameId = userToGameId.get(uid);
+      if (!activeGameId) return;
+      if (gameId && activeGameId !== gameId) return;
+      userToGameId.delete(uid);
     });
 
     socket.on('friend-challenge', async ({ toUserId, inviteId }) => {
