@@ -7,7 +7,7 @@
 const friendInvites = new Map();
 
 function attachFriendMatchHandlers(io, deps) {
-  const { supabase, userToSocket, socketToUser, createMatchFromQueueEntries } = deps;
+  const { supabase, userToSocket, socketToUser, userToGameId, createMatchFromQueueEntries } = deps;
 
   async function fetchProfile(userId) {
     if (!supabase || !userId) {
@@ -143,6 +143,27 @@ function attachFriendMatchHandlers(io, deps) {
     return true;
   }
 
+  async function markInviteAccepted(inviteId, gameId) {
+    if (!supabase || !inviteId) return;
+    try {
+      await supabase
+        .from('friend_match_invites')
+        .update({
+          status: 'accepted',
+          game_id: gameId ?? null,
+          responded_at: new Date().toISOString(),
+        })
+        .eq('id', inviteId)
+        .eq('status', 'pending');
+    } catch (err) {
+      console.warn('[friend-match] mark accepted failed:', err);
+    }
+  }
+
+  function isUserInActiveGame(userId) {
+    return Boolean(userId && userToGameId?.get(userId));
+  }
+
   function notifyInviteeCancelled(inviteId, inviteeId) {
     const inviteeSocketId = userToSocket.get(inviteeId);
     if (inviteeSocketId) {
@@ -162,6 +183,14 @@ function attachFriendMatchHandlers(io, deps) {
     socket.on('friend-challenge', async ({ toUserId, inviteId }) => {
       const inviterId = socket.data.userId || socketToUser.get(socket.id);
       if (!inviterId || !toUserId || !inviteId) return;
+
+      const memoryInvite = friendInvites.get(inviteId);
+      if (memoryInvite?.status === 'accepting') return;
+
+      if (isUserInActiveGame(inviterId) || isUserInActiveGame(toUserId)) {
+        console.warn('[friend-match] challenge skipped — player already in game');
+        return;
+      }
 
       const pending = await loadPendingInvite(inviteId, toUserId);
       if (!pending || pending.inviterId !== inviterId) {
@@ -203,6 +232,7 @@ function attachFriendMatchHandlers(io, deps) {
       const started = await startFriendlyMatch(pending);
       if (started) {
         friendInvites.delete(inviteId);
+        await markInviteAccepted(inviteId, userToGameId?.get(pending.inviterId));
       } else {
         pending.status = 'pending';
       }

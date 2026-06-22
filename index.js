@@ -1236,6 +1236,7 @@ const attachFriendHandlers = attachFriendMatchHandlers(io, {
   supabase,
   userToSocket,
   socketToUser,
+  userToGameId,
   createMatchFromQueueEntries,
 });
 
