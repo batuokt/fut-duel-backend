@@ -15,6 +15,8 @@ const userActiveMatchSessions = new Map();
  */
 const cancelledInvites = new Map();
 const CANCELLED_INVITE_TTL_MS = 60_000;
+/** Inviter hâlâ davet ekranında bekliyor mu (inviteId -> inviterId) */
+const inviterWaitingInvites = new Map();
 
 function markInviteCancelled(inviteId) {
   if (!inviteId) return;
@@ -285,6 +287,7 @@ function attachFriendMatchHandlers(io, deps) {
       }
 
       friendInvites.set(inviteId, pending);
+      inviterWaitingInvites.set(inviteId, inviterId);
 
       const delivered = await emitChallengeToInvitee(inviteId, inviterId, toUserId);
       if (!delivered) {
@@ -313,6 +316,12 @@ function attachFriendMatchHandlers(io, deps) {
       if (inviterId && pending.inviterId !== inviterId) return;
 
       if (!(await verifyFriendship(pending.inviterId, pending.inviteeId))) return;
+
+      // Inviter davet ekranından ayrıldı / iptal etti — maç başlatma.
+      if (inviterWaitingInvites.get(inviteId) !== pending.inviterId) {
+        socket.emit('friend-challenge-cancelled', { inviteId });
+        return;
+      }
 
       // Yarış: await'ler sırasında iptal gelmiş olabilir. Maç başlatmadan son kontrol.
       if (isInviteCancelled(inviteId)) {
@@ -364,6 +373,7 @@ function attachFriendMatchHandlers(io, deps) {
 
       // Senkron kilit: bu noktadan sonra gelen herhangi bir kabul reddedilir.
       markInviteCancelled(inviteId);
+      inviterWaitingInvites.delete(inviteId);
 
       const memoryInvite = friendInvites.get(inviteId);
       // Maç başlatılıyorsa (accept önce işlendiyse) iptal anlamsız; yine de bildir.
