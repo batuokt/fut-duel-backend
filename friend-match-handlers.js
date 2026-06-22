@@ -7,6 +7,36 @@
 const friendInvites = new Map();
 /** Client bildirimi: bot maçı vb. sunucu userToGameId dışı oturumlar */
 const userActiveMatchSessions = new Map();
+/**
+ * İptal edilen davet id'leri (senkron kilit). A daveti geri çekince DB yazısı
+ * propagate olmadan B kabul ederse, B tek başına maça giriyordu. Bu set sayesinde
+ * iptal sonrası gelen kabul anında reddedilir. TTL ile temizlenir.
+ * @type {Map<string, number>}
+ */
+const cancelledInvites = new Map();
+const CANCELLED_INVITE_TTL_MS = 60_000;
+
+function markInviteCancelled(inviteId) {
+  if (!inviteId) return;
+  const now = Date.now();
+  cancelledInvites.set(inviteId, now);
+  if (cancelledInvites.size > 200) {
+    for (const [id, ts] of cancelledInvites) {
+      if (now - ts > CANCELLED_INVITE_TTL_MS) cancelledInvites.delete(id);
+    }
+  }
+}
+
+function isInviteCancelled(inviteId) {
+  if (!inviteId) return false;
+  const ts = cancelledInvites.get(inviteId);
+  if (ts == null) return false;
+  if (Date.now() - ts > CANCELLED_INVITE_TTL_MS) {
+    cancelledInvites.delete(inviteId);
+    return false;
+  }
+  return true;
+}
 
 function attachFriendMatchHandlers(io, deps) {
   const { supabase, userToSocket, socketToUser, userToGameId, createMatchFromQueueEntries } = deps;
@@ -231,6 +261,8 @@ function attachFriendMatchHandlers(io, deps) {
       const inviterId = socket.data.userId || socketToUser.get(socket.id);
       if (!inviterId || !toUserId || !inviteId) return;
 
+      if (isInviteCancelled(inviteId)) return;
+
       const memoryInvite = friendInvites.get(inviteId);
       if (memoryInvite?.status === 'accepting') return;
 
@@ -261,6 +293,13 @@ function attachFriendMatchHandlers(io, deps) {
     });
 
     socket.on('friend-challenge-accept', async ({ inviteId, inviterId, inviteeId }) => {
+      // A iptal ettiyse (DB henüz güncellenmemiş olsa bile) kabulü reddet —
+      // aksi halde B tek başına maça giriyordu.
+      if (isInviteCancelled(inviteId)) {
+        socket.emit('friend-challenge-cancelled', { inviteId });
+        return;
+      }
+
       const inviteeSocketUserId = socket.data.userId || socketToUser.get(socket.id);
       const pending = await loadPendingInvite(
         inviteId,
@@ -275,6 +314,19 @@ function attachFriendMatchHandlers(io, deps) {
 
       if (!(await verifyFriendship(pending.inviterId, pending.inviteeId))) return;
 
+      // Yarış: await'ler sırasında iptal gelmiş olabilir. Maç başlatmadan son kontrol.
+      if (isInviteCancelled(inviteId)) {
+        socket.emit('friend-challenge-cancelled', { inviteId });
+        return;
+      }
+
+      // Inviter gerçekten davet ekranında mı? Maça girmeden önce hazır olduğunu doğrula.
+      const inviterSocketId = userToSocket.get(pending.inviterId);
+      if (!inviterSocketId) {
+        socket.emit('friend-challenge-cancelled', { inviteId });
+        return;
+      }
+
       friendInvites.set(inviteId, pending);
       pending.status = 'accepting';
 
@@ -284,6 +336,7 @@ function attachFriendMatchHandlers(io, deps) {
         await markInviteAccepted(inviteId, userToGameId?.get(pending.inviterId));
       } else {
         pending.status = 'pending';
+        socket.emit('friend-challenge-cancelled', { inviteId });
       }
     });
 
@@ -307,7 +360,14 @@ function attachFriendMatchHandlers(io, deps) {
     });
 
     socket.on('friend-challenge-cancel', async ({ inviteId }) => {
-      let inviteeId = friendInvites.get(inviteId)?.inviteeId;
+      if (!inviteId) return;
+
+      // Senkron kilit: bu noktadan sonra gelen herhangi bir kabul reddedilir.
+      markInviteCancelled(inviteId);
+
+      const memoryInvite = friendInvites.get(inviteId);
+      // Maç başlatılıyorsa (accept önce işlendiyse) iptal anlamsız; yine de bildir.
+      let inviteeId = memoryInvite?.inviteeId;
       friendInvites.delete(inviteId);
 
       if (!inviteeId) {
@@ -318,6 +378,18 @@ function attachFriendMatchHandlers(io, deps) {
       if (inviteeId) {
         notifyInviteeCancelled(inviteId, inviteeId);
       }
+    });
+
+    socket.on('disconnect', () => {
+      const uid = socket.data.userId || socketToUser.get(socket.id);
+      if (uid) {
+        // Bot / tutorial oturumları client-side bildirilir; kopunca kilidi bırak.
+        userActiveMatchSessions.delete(uid);
+        if (userToSocket.get(uid) === socket.id) {
+          userToSocket.delete(uid);
+        }
+      }
+      socketToUser.delete(socket.id);
     });
   };
 }
