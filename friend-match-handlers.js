@@ -238,15 +238,23 @@ function attachFriendMatchHandlers(io, deps) {
       }
     });
 
-    socket.on('friend-challenge-decline', ({ inviteId }) => {
-      const invite = friendInvites.get(inviteId);
-      if (!invite) return;
-      invite.status = 'declined';
-      const inviterSocketId = userToSocket.get(invite.inviterId);
+    socket.on('friend-challenge-decline', async ({ inviteId }) => {
+      if (!inviteId) return;
+
+      let inviterId = friendInvites.get(inviteId)?.inviterId;
+      friendInvites.delete(inviteId);
+
+      if (!inviterId) {
+        const row = await fetchInviteRow(inviteId);
+        inviterId = row?.inviter_id;
+      }
+
+      if (!inviterId) return;
+
+      const inviterSocketId = userToSocket.get(inviterId);
       if (inviterSocketId) {
         io.to(inviterSocketId).emit('friend-match-declined', { inviteId });
       }
-      friendInvites.delete(inviteId);
     });
 
     socket.on('friend-challenge-cancel', async ({ inviteId }) => {
