@@ -8,10 +8,18 @@ const { createClient } = require('@supabase/supabase-js');
 
 // ============= SUPABASE SETUP =============
 const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_ANON_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabaseAnonKey = process.env.SUPABASE_ANON_KEY;
+// Friend match davet doğrulaması RLS nedeniyle service role gerektirir.
+const supabaseKey = supabaseServiceKey || supabaseAnonKey;
 
 if (!supabaseUrl || !supabaseKey) {
   console.warn('[Warning] Supabase credentials not found. User profile endpoints may not work.');
+}
+if (!supabaseServiceKey) {
+  console.warn(
+    '[Warning] SUPABASE_SERVICE_ROLE_KEY missing — friend match invites cannot be verified; accepts will fail.',
+  );
 }
 
 const supabase = supabaseUrl && supabaseKey ? createClient(supabaseUrl, supabaseKey) : null;
@@ -49,7 +57,13 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'ok' });
+  res.status(200).json({
+    status: 'ok',
+    friendMatch: {
+      supabaseConfigured: Boolean(supabase),
+      serviceRoleKey: Boolean(supabaseServiceKey),
+    },
+  });
 });
 
 // ============= HELPER FUNCTIONS =============

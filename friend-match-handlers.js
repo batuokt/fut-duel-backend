@@ -49,14 +49,26 @@ function attachFriendMatchHandlers(io, deps) {
   }
 
   async function fetchInviteRow(inviteId) {
-    if (!supabase || !inviteId) return null;
+    if (!supabase || !inviteId) {
+      if (!supabase) {
+        console.warn('[friend-match] fetch invite skipped — supabase client not configured');
+      }
+      return null;
+    }
     try {
       const { data, error } = await supabase
         .from('friend_match_invites')
         .select('id, inviter_id, invitee_id, status, expires_at')
         .eq('id', inviteId)
         .maybeSingle();
-      if (error || !data) return null;
+      if (error) {
+        console.warn('[friend-match] fetch invite error:', error.message, inviteId);
+        return null;
+      }
+      if (!data) {
+        console.warn('[friend-match] invite not found in DB:', inviteId);
+        return null;
+      }
       return data;
     } catch (err) {
       console.warn('[friend-match] fetch invite failed:', err);
