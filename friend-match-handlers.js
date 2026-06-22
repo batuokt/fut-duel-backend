@@ -48,14 +48,33 @@ function attachFriendMatchHandlers(io, deps) {
     }
   }
 
-  function resolveInvite(inviteId, inviterId, inviteeId, inviteeSocketUserId) {
-    let invite = friendInvites.get(inviteId);
-    if (invite) return invite;
-    if (!inviteId || !inviterId || !inviteeId) return null;
-    if (inviteeSocketUserId && inviteeSocketUserId !== inviteeId) return null;
-    invite = { inviterId, inviteeId, status: 'pending' };
-    friendInvites.set(inviteId, invite);
-    return invite;
+  async function fetchInviteRow(inviteId) {
+    if (!supabase || !inviteId) return null;
+    try {
+      const { data, error } = await supabase
+        .from('friend_match_invites')
+        .select('id, inviter_id, invitee_id, status, expires_at')
+        .eq('id', inviteId)
+        .maybeSingle();
+      if (error || !data) return null;
+      return data;
+    } catch (err) {
+      console.warn('[friend-match] fetch invite failed:', err);
+      return null;
+    }
+  }
+
+  async function loadPendingInvite(inviteId, expectedInviteeId) {
+    const row = await fetchInviteRow(inviteId);
+    if (!row) return null;
+    if (row.status !== 'pending') return null;
+    if (row.expires_at && new Date(row.expires_at) <= new Date()) return null;
+    if (expectedInviteeId && row.invitee_id !== expectedInviteeId) return null;
+    return {
+      inviterId: row.inviter_id,
+      inviteeId: row.invitee_id,
+      status: 'pending',
+    };
   }
 
   async function emitChallengeToInvitee(inviteId, inviterId, inviteeId) {
@@ -112,6 +131,13 @@ function attachFriendMatchHandlers(io, deps) {
     return true;
   }
 
+  function notifyInviteeCancelled(inviteId, inviteeId) {
+    const inviteeSocketId = userToSocket.get(inviteeId);
+    if (inviteeSocketId) {
+      io.to(inviteeSocketId).emit('friend-challenge-cancelled', { inviteId });
+    }
+  }
+
   return (socket) => {
     socket.on('register-presence', ({ userId, odId }) => {
       const uid = userId || odId;
@@ -125,16 +151,18 @@ function attachFriendMatchHandlers(io, deps) {
       const inviterId = socket.data.userId || socketToUser.get(socket.id);
       if (!inviterId || !toUserId || !inviteId) return;
 
+      const pending = await loadPendingInvite(inviteId, toUserId);
+      if (!pending || pending.inviterId !== inviterId) {
+        console.warn('[friend-match] challenge rejected — invite not pending');
+        return;
+      }
+
       if (!(await verifyFriendship(inviterId, toUserId))) {
         console.warn('[friend-match] challenge rejected — not friends');
         return;
       }
 
-      friendInvites.set(inviteId, {
-        inviterId,
-        inviteeId: toUserId,
-        status: 'pending',
-      });
+      friendInvites.set(inviteId, pending);
 
       const delivered = await emitChallengeToInvitee(inviteId, inviterId, toUserId);
       if (!delivered) {
@@ -144,18 +172,27 @@ function attachFriendMatchHandlers(io, deps) {
 
     socket.on('friend-challenge-accept', async ({ inviteId, inviterId, inviteeId }) => {
       const inviteeSocketUserId = socket.data.userId || socketToUser.get(socket.id);
-      const invite = resolveInvite(inviteId, inviterId, inviteeId, inviteeSocketUserId);
-      if (!invite || invite.status !== 'pending') return;
+      const pending = await loadPendingInvite(
+        inviteId,
+        inviteeSocketUserId || inviteeId,
+      );
+      if (!pending) {
+        socket.emit('friend-challenge-cancelled', { inviteId });
+        return;
+      }
 
-      if (!(await verifyFriendship(invite.inviterId, invite.inviteeId))) return;
+      if (inviterId && pending.inviterId !== inviterId) return;
 
-      invite.status = 'accepting';
-      const started = await startFriendlyMatch(invite);
+      if (!(await verifyFriendship(pending.inviterId, pending.inviteeId))) return;
+
+      friendInvites.set(inviteId, pending);
+      pending.status = 'accepting';
+
+      const started = await startFriendlyMatch(pending);
       if (started) {
-        invite.status = 'accepted';
         friendInvites.delete(inviteId);
       } else {
-        invite.status = 'pending';
+        pending.status = 'pending';
       }
     });
 
@@ -170,15 +207,18 @@ function attachFriendMatchHandlers(io, deps) {
       friendInvites.delete(inviteId);
     });
 
-    socket.on('friend-challenge-cancel', ({ inviteId }) => {
-      const invite = friendInvites.get(inviteId);
-      if (!invite) return;
-      invite.status = 'cancelled';
-      const inviteeSocketId = userToSocket.get(invite.inviteeId);
-      if (inviteeSocketId) {
-        io.to(inviteeSocketId).emit('friend-challenge-cancelled', { inviteId });
-      }
+    socket.on('friend-challenge-cancel', async ({ inviteId }) => {
+      let inviteeId = friendInvites.get(inviteId)?.inviteeId;
       friendInvites.delete(inviteId);
+
+      if (!inviteeId) {
+        const row = await fetchInviteRow(inviteId);
+        inviteeId = row?.invitee_id;
+      }
+
+      if (inviteeId) {
+        notifyInviteeCancelled(inviteId, inviteeId);
+      }
     });
   };
 }
