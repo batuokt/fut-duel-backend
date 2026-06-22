@@ -792,6 +792,12 @@ function createMatchFromQueueEntries(p1, p2, { mode = 'normal', round = null } =
       payload.opponent.avatar_key = opponent.avatar_key ?? null;
     }
 
+    if (mode === 'friendly') {
+      payload.mode = 'friendly';
+      payload.opponent.rank_score = opponent.rank_score ?? null;
+      payload.opponent.avatar_key = opponent.avatar_key ?? null;
+    }
+
     return payload;
   };
 
@@ -1140,6 +1146,8 @@ function finishGame(game, { reason, winnerOdId, loserOdId, forfeiterUserId } = {
     const winner =
       winnerOdId || odIds.find((id) => id !== forfeiter) || null;
 
+    const isFriendly = game.mode === 'friendly';
+
     const payload = {
       gameId: game.id,
       isGameOver: true,
@@ -1149,17 +1157,17 @@ function finishGame(game, { reason, winnerOdId, loserOdId, forfeiterUserId } = {
       reason: reason === 'forfeit' ? 'forfeit' : 'opponent-disconnected',
       winner: winner || '',
       loser: forfeiter || '',
-      rpChange: calculateRpChange(winner, forfeiter, reason),
+      rpChange: isFriendly ? {} : calculateRpChange(winner, forfeiter, reason),
     };
+
+    if (isFriendly) {
+      payload.friendly = true;
+    }
 
     game.lastGameEndedPayload = payload;
     io.to(game.id).emit('game-ended', payload);
 
-    // Sunucu-otoriter: kaçan oyuncunun RP cezası + forfeit_loss maç geçmişi.
-    // (Kazananın client'ı game-ended ile penalize_forfeiter + kendi forfeit_win
-    // geçmişini de yazar; forfeit_audit / match_history dedup'ı sayesinde çift
-    // ceza ya da çift kayıt olmaz.)
-    if (forfeiter) {
+    if (forfeiter && !isFriendly) {
       void handleServerForfeit(game, forfeiter, winner);
     }
   } else {
@@ -1175,7 +1183,9 @@ function finishGame(game, { reason, winnerOdId, loserOdId, forfeiterUserId } = {
       loserOdId = odIds.find((id) => id !== winnerOdId) || null;
     }
 
-    const rpChange = calculateRpChange(winnerOdId, loserOdId, reason);
+    const rpChange = game.mode === 'friendly'
+      ? {}
+      : calculateRpChange(winnerOdId, loserOdId, reason);
 
     const payload = {
       gameId: game.id,
@@ -1187,6 +1197,10 @@ function finishGame(game, { reason, winnerOdId, loserOdId, forfeiterUserId } = {
       reason: 'normal',
       rpChange,
     };
+
+    if (game.mode === 'friendly') {
+      payload.friendly = true;
+    }
 
     game.lastGameEndedPayload = payload;
     io.to(game.id).emit('game-ended', payload);
@@ -1203,8 +1217,18 @@ function finishGame(game, { reason, winnerOdId, loserOdId, forfeiterUserId } = {
 
 // ============= SOCKET.IO EVENTS =============
 
+const { attachFriendMatchHandlers } = require('./friend-match-handlers');
+const attachFriendHandlers = attachFriendMatchHandlers(io, {
+  supabase,
+  userToSocket,
+  socketToUser,
+  createMatchFromQueueEntries,
+});
+
 io.on('connection', (socket) => {
   console.log('[Socket] Connected:', socket.id);
+
+  attachFriendHandlers(socket);
 
   // Track mapping (updated on events with odId)
   socket.on('disconnect', (reason) => {
