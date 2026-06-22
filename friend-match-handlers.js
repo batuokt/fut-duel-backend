@@ -195,6 +195,23 @@ function attachFriendMatchHandlers(io, deps) {
       userToGameId.delete(uid);
     });
 
+    socket.on('friend-challenge-precheck', ({ toUserId }, callback) => {
+      const inviterId = socket.data.userId || socketToUser.get(socket.id);
+      if (!inviterId || !toUserId) {
+        callback?.({ ok: false, reason: 'invalid_target' });
+        return;
+      }
+      if (isUserInActiveGame(inviterId)) {
+        callback?.({ ok: false, reason: 'inviter_in_game' });
+        return;
+      }
+      if (isUserInActiveGame(toUserId)) {
+        callback?.({ ok: false, reason: 'invitee_in_game' });
+        return;
+      }
+      callback?.({ ok: true });
+    });
+
     socket.on('friend-challenge', async ({ toUserId, inviteId }) => {
       const inviterId = socket.data.userId || socketToUser.get(socket.id);
       if (!inviterId || !toUserId || !inviteId) return;
@@ -203,7 +220,9 @@ function attachFriendMatchHandlers(io, deps) {
       if (memoryInvite?.status === 'accepting') return;
 
       if (isUserInActiveGame(inviterId) || isUserInActiveGame(toUserId)) {
-        console.warn('[friend-match] challenge skipped — player already in game');
+        const reason = isUserInActiveGame(inviterId) ? 'inviter_in_game' : 'invitee_in_game';
+        console.warn('[friend-match] challenge skipped — player in game', reason);
+        socket.emit('friend-challenge-rejected', { inviteId, reason });
         return;
       }
 
