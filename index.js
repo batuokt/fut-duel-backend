@@ -1019,6 +1019,8 @@ function completeRound(game) {
       currentGame.currentRound = getRoundInfoFromGame(currentGame, currentGame.roundNumber);
       currentGame.currentRoundStartedAt = Date.now();
       currentGame.phase = 'playing';
+      // Reveal sırasında gelen erken submit'ler bir sonraki tura sızmasın.
+      currentGame.moves = {};
 
       emitGameState(currentGame);
       scheduleRoundTimer(currentGame);
@@ -1495,6 +1497,31 @@ io.on('connection', (socket) => {
         message: 'Game not available',
         code: 'GAME_NOT_AVAILABLE',
       });
+      return;
+    }
+
+    // Client reveal (2.5s) sunucu tur geçişinden (3s) önce biterse erken
+    // submit, hâlâ PAC olan currentRound üzerine yazılıp sonraki tura
+    // taşınıyordu — iki oyuncu farklı soru görüp tek cevapla skorlanıyordu.
+    if (game.phase !== 'playing') {
+      socket.emit('move-error', {
+        message: 'Round is not accepting moves',
+        code: 'ROUND_NOT_PLAYING',
+      });
+      return;
+    }
+
+    const submittedRound = data?.round;
+    if (
+      typeof submittedRound === 'number' &&
+      game.currentRound?.round != null &&
+      submittedRound !== game.currentRound.round
+    ) {
+      socket.emit('move-error', {
+        message: 'Move is for a different round',
+        code: 'ROUND_MISMATCH',
+      });
+      emitGameStateToPlayer(game, odId);
       return;
     }
 
